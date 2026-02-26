@@ -1,0 +1,21 @@
+services:
+  aida-agentbackend:
+    build: .
+    image: aida-agentbackend:v1
+    ports:
+      - "8080:80"
+    env_file:
+      - .env
+    environment:
+      # We still use Azure Storage libraries, so we point them to Azurite
+      - AZURE_BLOB_CONNECTION_STRING=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;
+      - AZURE_BLOB_CONTAINER=scraped-content
+    depends_on:
+      - azurite
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+      - "10002:10002"
