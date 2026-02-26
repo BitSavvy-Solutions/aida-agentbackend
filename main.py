@@ -27,4 +27,4 @@ app.include_router(github.router, prefix="/api/github")
 
 @app.get("/")
 async def health_check():
-    return {"status": "running", "service": "iverse-backend"}
+    return {"status": "running", "service": "aida-agentbackend"}

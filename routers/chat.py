@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from langchain_openai import ChatOpenAI
+from apis.chunk_enhancer import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 from apis.credit_manager import queue_credit_deduction
 
@@ -30,7 +30,6 @@ COMPILED_ANONYMOUS_PATTERNS = [re.compile(p, re.IGNORECASE) for p in ALLOWED_ANO
 @router.post("/iverse_agent")
 async def iverse_agent(body: ChatRequest):
     thread_id = body.thread_id or str(uuid.uuid4())
-
     # --- Security Check ---
     if not body.user_id:
         is_allowed = any(p.match(body.model) for p in COMPILED_ANONYMOUS_PATTERNS)
@@ -77,10 +76,12 @@ async def iverse_agent(body: ChatRequest):
                 if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
                     usage = chunk.usage_metadata
                     total_tokens = usage.get('total_tokens', 0)
+
                     payload["token_usage"] = usage
 
                 if hasattr(chunk, 'response_metadata') and chunk.response_metadata:
                     cost = chunk.response_metadata.get('cost', 0)
+
                     if cost > 0:
                         payload["cost"] = cost
                         if body.user_id:

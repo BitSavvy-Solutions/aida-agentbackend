@@ -1,6 +1,7 @@
 services:
-  iverse-backend:
+  aida-agentbackend:
     build: .
+    image: aida-agentbackend:v1
     ports:
       - "8080:80"
     env_file:

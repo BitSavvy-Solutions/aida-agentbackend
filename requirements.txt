@@ -1,8 +1,9 @@
 fastapi
 uvicorn[standard]
 python-multipart
-langchain-core>=0.3.0
-langchain-openai>=0.3.0
+langchain-core==0.3.76
+langchain-openai==0.3.33
+langgraph==1.0.1
 openai
 python-dotenv
 azure-storage-blob
