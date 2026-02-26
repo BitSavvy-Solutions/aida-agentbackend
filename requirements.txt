@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+python-multipart
+langchain-core>=0.3.0
+langchain-openai>=0.3.0
+openai
+python-dotenv
+azure-storage-blob
+azure-storage-queue
+aiohttp
+requests
+readability-lxml
+html2text
+httpx
+beautifulsoup4
+pydantic
