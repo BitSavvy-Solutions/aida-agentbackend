@@ -204,7 +204,6 @@ async def scrape_external_url_to_markdown(url: str, force_rebuild: bool = False,
             return doc.summary()
         
         main_html = await asyncio.to_thread(parse_html_content, html)
-        logger.info(f"Extracted main content for URL: {url}")
     except Exception as e:
         logging.error(f"Failed to extract main content from HTML for URL '{url}': {e}")
         main_html = html # fallback to full html if extraction fails
@@ -218,7 +217,6 @@ async def scrape_external_url_to_markdown(url: str, force_rebuild: bool = False,
             return h.handle(html_content)
         
         markdown_content = await asyncio.to_thread(convert_to_markdown, main_html)
-        logger.info(f"Converted content to markdown for URL: {url}")
     except Exception as e:
         logging.error(f"Failed to convert HTML to Markdown for URL '{url}': {e}")
         markdown_content = "WARNING: Content conversion failed."
@@ -234,7 +232,6 @@ async def scrape_external_url_to_markdown(url: str, force_rebuild: bool = False,
     # Cache results
     await get_cache_client().save_markdown(url, full_markdown)
     
-    logger.info(f"Scrape complete for {url} (fetch time: {metadata.fetch_time_ms:.2f}ms)")
     
     if include_metadata:
         return {
