@@ -57,7 +57,6 @@ async def queue_credit_deduction(
             
             await queue_client.send_message(base64_message)
 
-        logger.info(f"Queued deduction {charge_id} for user {user_id}: ${cost}")
 
     except Exception as e:
         logger.error(f"Failed to queue credit deduction: {e}", exc_info=True)

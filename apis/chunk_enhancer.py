@@ -324,7 +324,6 @@ def _convert_message_to_dict(message: BaseMessage) -> dict:
 def _convert_delta_to_message_chunk(
     _dict: Mapping[str, Any], default_class: type[BaseMessageChunk]
 ) -> BaseMessageChunk:
-    logger.info("This works")
     id_ = _dict.get("id")
     role = cast(str, _dict.get("role"))
     content = cast(str, _dict.get("content") or "")
@@ -787,7 +786,6 @@ class BaseChatOpenAI(BaseChatModel):
         default_chunk_class: type,
         base_generation_info: Optional[dict],
     ) -> Optional[ChatGenerationChunk]:
-        logger.info(f"Chunk is: {chunk}")
         if chunk.get("type") == "content.delta":  # from beta.chat.completions.stream
             return None
         token_usage = chunk.get("usage")
