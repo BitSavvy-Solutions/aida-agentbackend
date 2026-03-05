@@ -62,7 +62,12 @@ async def iverse_agent(body: ChatRequest):
         api_key=openrouter_key,
         base_url="https://openrouter.ai/api/v1",
         temperature=0.2,
-        stream_usage=True
+        stream_usage=True,
+        extra_body={
+            "reasoning": {
+                "enabled": True
+            }
+        }
     )
 
     async def chat_stream_processor():
