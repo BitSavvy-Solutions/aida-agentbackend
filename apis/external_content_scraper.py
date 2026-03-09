@@ -12,6 +12,9 @@ import json
 import time
 from datetime import datetime
 
+# Import the new YouTube handler
+from apis.youtube_transcript import is_youtube_url, fetch_youtube_transcript
+
 load_dotenv()
 
 # Module specific log parsing
@@ -30,7 +33,6 @@ class ScraperMetadata:
         return asdict(self)
 
 # Azure Blob Storage setup for scraped content caching
-# CHANGE: Sync to Async
 class ExternalContentCache:
     def __init__(self):
         self.blob_connection_string = os.getenv("AZURE_BLOB_CONNECTION_STRING")
@@ -38,7 +40,6 @@ class ExternalContentCache:
             raise ValueError("Missing AZURE_BLOB_CONNECTION_STRING environment variable")
  
         self.container_name = os.getenv("AZURE_BLOB_CONTAINER")
-        # Use the async client by creating it within an async context or at startup
         self.blob_service_client = BlobServiceClient.from_connection_string(self.blob_connection_string)
         self.scraped_folder = "scraped_external_content"
     
@@ -48,7 +49,6 @@ class ExternalContentCache:
         return f"externalcache/{self.scraped_folder}/{sanitized}.md"
     
     async def get_cached_markdown(self, url: str) -> tuple[str, Dict[str, Any]]:
-        # Retrieve cached markdown content from Azure Blob Storage if exists, else return None
         blob_name = self._blob_name(url)
         try:
             blob_client = self.blob_service_client.get_blob_client(container=self.container_name, blob=blob_name)
@@ -56,7 +56,6 @@ class ExternalContentCache:
             data = await download_stream.readall()
             content = data.decode('utf-8')
         
-            # Get blob properties for cache metadata
             properties = await blob_client.get_blob_properties()
 
             metadata = {
@@ -81,11 +80,9 @@ class ExternalContentCache:
             logging.error(f"Failed to save scraped content to blob '{blob_name}': {e}")
 
 
-# Global cache client instance (lazy initialization)
 _cache_client_instance = None
 
 def get_cache_client() -> ExternalContentCache:
-    """Get or create the singleton cache client instance"""
     global _cache_client_instance
     if _cache_client_instance is None:
         _cache_client_instance = ExternalContentCache()
@@ -101,17 +98,7 @@ async def scrape_external_url_to_markdown(url: str, force_rebuild: bool = False,
         source_url=url
     )
 
-    """
-    Main scraping function:
-    - check cache unless force_rebuild is True
-    - Use Scraping Robot API to fetch rendered HTML output of the URL
-      (handles proxies, retries, JS rendering transparently)
-    - extract main content using readability-lxml
-    - convert content to markdown via html2text
-    - cache the markdown to Azure Blob Storage
-    - append citation info to markdown
-    - return markdown string
-    """
+    # 1. Check Cache
     if not force_rebuild:
         cached, cache_meta = await get_cache_client().get_cached_markdown(url)
         if cached:
@@ -120,118 +107,80 @@ async def scrape_external_url_to_markdown(url: str, force_rebuild: bool = False,
             metadata.scraped_at = cache_meta.get("cached_at")
             metadata.fetch_time_ms = (time.time() - start_time) * 1000
 
-            logger.info(f"Cache HIT for external URL: {url} (fetch time: {metadata.fetch_time_ms:.2f}ms)")
+            logger.info(f"Cache HIT for external URL: {url}")
             
             if include_metadata:
                 return {
                     "content": cached,
                     "metadata": metadata.to_dict()
                 }
-
             return {"content": cached}
         
     logger.info(f"Cache MISS for external URL: {url} - scraping...")
     
-    # Retrieve Scraping Robot API key from environment variable
-    scrapingrobot_api_key = os.getenv("SCRAPINGROBOT_API_KEY")
-    if not scrapingrobot_api_key:
-        raise ValueError("Missing SCRAPINGROBOT_API_KEY environment variable")
+    full_markdown = ""
 
-    api_endpoint = "https://api.scrapingrobot.com"
-    params = {
-        "token": scrapingrobot_api_key,
-        "url": url,
-        # "render": "true"  # Optionally add if JavaScript rendering is needed
-    }
-    
-    html = ""
-    fetch_start = time.time()
-
+    # 2. Determine Strategy: YouTube API vs Scraping Robot
     try:
-        # Make an async GET request to Scraping Robot API to fetch the fully rendered HTML
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.get(api_endpoint, params=params)
-            resp.raise_for_status()
+        if is_youtube_url(url):
+            logger.info(f"Detected YouTube URL: {url}. Using Transcript API.")
+            full_markdown = await fetch_youtube_transcript(url)
+        else:
+            # --- Existing Scraping Robot Logic ---
+            scrapingrobot_api_key = os.getenv("SCRAPINGROBOT_API_KEY")
+            if not scrapingrobot_api_key:
+                raise ValueError("Missing SCRAPINGROBOT_API_KEY environment variable")
 
-            logger.info(f"📡 API Response Status: {resp.status_code}")
-            logger.info(f"📡 API Response Preview: {resp.text[:500]}")
+            api_endpoint = "https://api.scrapingrobot.com"
+            params = {
+                "token": scrapingrobot_api_key,
+                "url": url,
+            }
+            
+            html = ""
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(api_endpoint, params=params)
+                resp.raise_for_status()
+                response_data = resp.json()
 
-            response_data = resp.json()
+                if response_data.get("status") == "SUCCESS":
+                    html = response_data.get("result", "")
+                else:
+                    raise Exception(f"Scraping Robot API status: {response_data.get('status')}")
 
-            logger.info(f"📦 Full response data: {json.dumps(response_data, indent=2)[:1000]}")
+            # Extract content
+            def parse_html_content(html_str):
+                doc = Document(html_str)
+                return doc.summary()
+            
+            main_html = await asyncio.to_thread(parse_html_content, html)
+            
+            # Convert to Markdown
+            def convert_to_markdown(html_content):
+                h = html2text.HTML2Text()
+                h.ignore_links = False
+                h.ignore_images = True
+                return h.handle(html_content)
+            
+            markdown_content = await asyncio.to_thread(convert_to_markdown, main_html)
+            
+            # Append citation
+            full_markdown = markdown_content + f"\n\n---\n\n*Content sourced from {url}*"
 
-            # Check if the API call was successful
-            if response_data.get("status") == "SUCCESS":
-                # Extract the HTML from the 'result' field
-                html = response_data.get("result", "")
-                logger.info(f"Fetched content from Scraping Robot API for URL: {url}")
-
-                logger.info(f"Raw HTML length: {len(html)} characters")
-                logger.info(f"HTML preview (first 2000 chars):\n{html[:2000]}")
-                logger.info(f"Does HTML contain 'Python is a': {'Python is a' in html}")
-                logger.info(f"Full response data keys: {response_data.keys()}")
-
-            else:
-                error_msg = f"Scraping Robot API returned status: {response_data.get('status')}"
-                logger.error(error_msg)
-                metadata.fetch_time_ms = (time.time() - start_time) * 1000
-                return {
-                    "content": f"Error: {error_msg}",
-                    "metadata": metadata.to_dict() if include_metadata else None
-                }
-
-    except httpx.RequestError as e:
-        logging.error(f"Failed to fetch URL '{url}' via Scraping Robot API: {e}")
+    except Exception as e:
+        logging.error(f"Failed to scrape/fetch URL '{url}': {e}")
         metadata.fetch_time_ms = (time.time() - start_time) * 1000
         return {
-            "content": f"Error fetching content from {url}: {e}",
-            "metadata": metadata.to_dict() if include_metadata else None
-        }
-    
-    except json.JSONDecodeError as e:
-        logging.error(f"Failed to parse JSON response from Scraping Robot API: {e}")
-        metadata.fetch_time_ms = (time.time() - start_time) * 1000
-        return {
-            "content": f"Error: Invalid JSON response from scraping service",
+            "content": f"Error fetching content: {str(e)}",
             "metadata": metadata.to_dict() if include_metadata else None
         }
 
-    # Extract main content from fetched HTML using readability-lxml
-    # Run blocking HTML extraction in thread to avoid blocking event loop
-    try:
-        def parse_html_content(html):
-            doc = Document(html)
-            return doc.summary()
-        
-        main_html = await asyncio.to_thread(parse_html_content, html)
-    except Exception as e:
-        logging.error(f"Failed to extract main content from HTML for URL '{url}': {e}")
-        main_html = html # fallback to full html if extraction fails
-    
-    # Run blocking markdown conversion in thread
-    try:
-        def convert_to_markdown(html_content):
-            h = html2text.HTML2Text()
-            h.ignore_links = False
-            h.ignore_images = True
-            return h.handle(html_content)
-        
-        markdown_content = await asyncio.to_thread(convert_to_markdown, main_html)
-    except Exception as e:
-        logging.error(f"Failed to convert HTML to Markdown for URL '{url}': {e}")
-        markdown_content = "WARNING: Content conversion failed."
-    
-    # Append citation for transparency
-    citation = f"\n\n---\n\n*Content sourced from {url}*"
-    full_markdown = markdown_content + citation
-
+    # 3. Save to Cache & Return
     metadata.content_length = len(full_markdown)
     metadata.fetch_time_ms = (time.time() - start_time) * 1000
     metadata.scraped_at = datetime.now().isoformat()
     
-    # Cache results
     await get_cache_client().save_markdown(url, full_markdown)
-    
     
     if include_metadata:
         return {
