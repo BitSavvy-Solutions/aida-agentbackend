@@ -3,6 +3,7 @@ import re
 import httpx
 import logging
 import math
+from urllib.parse import urlparse, parse_qs
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,18 @@ def is_youtube_url(url: str) -> bool:
     )
     return bool(re.match(youtube_regex, url))
 
+def _get_video_id(url: str) -> str:
+    """Extracts the 11-character video ID from the URL."""
+    youtube_regex = (
+        r'(https?://)?(www\.)?'
+        r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
+        r'(watch\?v=|embed/|v/|.+\?v=|shorts/)?([^&=%\?]{11})'
+    )
+    match = re.match(youtube_regex, url)
+    if match:
+        return match.group(6)
+    return None
+
 def _format_timestamp(seconds: float) -> str:
     """Converts seconds to MM:SS format."""
     seconds = int(seconds)
@@ -29,11 +42,15 @@ def _format_timestamp(seconds: float) -> str:
 
 async def fetch_youtube_transcript(url: str) -> str:
     """
-    Fetches transcript from Transcript API and converts it to Markdown.
+    Fetches transcript from Transcript API and converts it to Markdown with clickable timestamps.
     """
     api_key = os.getenv("TRANSCRIPT_API_KEY")
     if not api_key:
         raise ValueError("Missing TRANSCRIPT_API_KEY environment variable")
+
+    # Extract Video ID to build the timestamp links later
+    video_id = _get_video_id(url)
+    base_video_url = f"https://www.youtube.com/watch?v={video_id}"
 
     api_url = "https://transcriptapi.com/api/v2/youtube/transcript"
     
@@ -44,7 +61,7 @@ async def fetch_youtube_transcript(url: str) -> str:
     
     params = {
         "video_url": url,
-        "format": "json", # We request JSON to format it nicely ourselves
+        "format": "json", 
         "include_timestamp": "true",
         "send_metadata": "true"
     }
@@ -83,9 +100,15 @@ async def fetch_youtube_transcript(url: str) -> str:
         for segment in segments:
             start_time = segment.get("start", 0)
             text = segment.get("text", "").strip()
-            timestamp = _format_timestamp(start_time)
             
-            # Format: **[04:20]** The text content here...
-            markdown_output.append(f"**[{timestamp}]** {text}")
+            # Create visual timestamp (e.g., 04:20)
+            timestamp_text = _format_timestamp(start_time)
+            
+            # Create clickable link (e.g., https://youtube.com/watch?v=xyz&t=260s)
+            # We cast to int to remove decimals for the URL
+            timestamp_link = f"{base_video_url}&t={int(start_time)}s"
+            
+            # Format: [**[04:20]**](url) The text content here...
+            markdown_output.append(f"[**[{timestamp_text}]**]({timestamp_link}) {text}")
 
     return "\n\n".join(markdown_output)
