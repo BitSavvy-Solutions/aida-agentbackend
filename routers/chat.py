@@ -123,11 +123,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
         yield f'data: {json.dumps({"thread_id": thread_id, "delta_content": ""})}\n\n'
 
         try:
-<<<<<<< HEAD
             async for chunk in llm.astream(formatted_messages):                     
-=======
-            async for chunk in llm.astream(formatted_messages):
->>>>>>> 74ec27d (Add api_key check)
                 payload = {"thread_id": thread_id}
 
                 if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
@@ -159,12 +155,9 @@ async def iverse_agent(req: Request, body: ChatRequest):
                 if chunk.content:
                     payload["delta_content"] = chunk.content
 
-<<<<<<< HEAD
                 if hasattr(chunk, "additional_kwargs") and "images" in chunk.additional_kwargs:
                     payload["images"] = chunk.additional_kwargs["images"]
                 
-=======
->>>>>>> 74ec27d (Add api_key check)
                 if hasattr(chunk, "additional_kwargs"):
                     reasoning = chunk.additional_kwargs.get("reasoning_content")
                     if reasoning:
