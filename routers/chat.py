@@ -1,3 +1,5 @@
+# routers/chat.py
+
 import os
 import json
 import uuid
@@ -10,36 +12,81 @@ from pydantic import BaseModel
 from apis.chunk_enhancer import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 from apis.credit_manager import queue_credit_deduction
+from dependencies.auth import validate_api_token
 
 router = APIRouter()
 
-# Pydantic Model for Request Body
+
 class ChatRequest(BaseModel):
     user_input: Optional[str] = None
     image_data_urls: List[str] = []
     model: str = 'google/gemini-flash-1.5'
-    user_id: Optional[str] = None
+    user_id: Optional[str] = None      # kept intentionally for backward compatibility
     message_history: List[Dict[str, Any]] = []
     thread_id: Optional[str] = None
 
-# Config
+
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
 ALLOWED_ANONYMOUS_MODELS = [r"google/gemini-3-flash-preview", r"^.*deepseek.*"]
 COMPILED_ANONYMOUS_PATTERNS = [re.compile(p, re.IGNORECASE) for p in ALLOWED_ANONYMOUS_MODELS]
 
+
 @router.post("/iverse_agent")
-async def iverse_agent(body: ChatRequest):
+async def iverse_agent(req: Request, body: ChatRequest):
     thread_id = body.thread_id or str(uuid.uuid4())
-    # --- Security Check ---
-    if not body.user_id:
-        is_allowed = any(p.match(body.model) for p in COMPILED_ANONYMOUS_PATTERNS)
-        if not is_allowed:
-            raise HTTPException(status_code=403, detail=f"Model '{body.model}' requires sign-in")
 
+    resolved_user_id: Optional[str] = None
+    auth_method: str = "anonymous"
+
+    # ── 1. Token Auth Resolution ──
+    auth_header = req.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token_string = auth_header.replace("Bearer ", "").strip()
+        token_doc = await validate_api_token(token_string)
+
+        if token_doc:
+            resolved_user_id = token_doc.get("userId")
+            auth_method = "token"
+            
+            # Extract scopes (new format) and status (old format)
+            scopes = token_doc.get("scopes", [])
+
+            # Check if blocked
+            if "aida:blocked" in scopes:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Your account has been suspended. Please contact support."
+                )
+            # If they are not blocked, they automatically have full access to all models.
+
+        else:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired token. Please sign in again."
+            )
+
+    # ── 2. Legacy Fallback ──
+    # Only runs if no Bearer token was provided
+    elif body.user_id:
+        resolved_user_id = body.user_id
+        auth_method = "legacy"
+
+    # ── 3. Access Control ──
+    is_free_model = any(p.match(body.model) for p in COMPILED_ANONYMOUS_PATTERNS)
+
+    # Logged in users (token or legacy) bypass this check entirely.
+    # Only anonymous users are restricted to free models.
+    if auth_method == "anonymous" and not is_free_model:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Model '{body.model}' requires sign-in."
+        )
+
+    # ── Input Validation ──
     if not body.user_input and not body.image_data_urls and not body.message_history:
-        raise HTTPException(status_code=400, detail="Input required")
+        raise HTTPException(status_code=400, detail="Input required.")
 
-    # --- Format Messages ---
+    # ── Format Messages ──
     formatted_messages = []
     for msg in body.message_history:
         if msg.get('type') == 'ai':
@@ -52,11 +99,12 @@ async def iverse_agent(body: ChatRequest):
         new_content.append({"type": "text", "text": body.user_input})
     for url in body.image_data_urls:
         new_content.append({"type": "image_url", "image_url": {"url": url}})
-    
+
     if new_content:
         formatted_messages.append(HumanMessage(content=new_content))
 
-    # --- Stream Logic ---
+    # ── Stream Logic ──────────────────────────────────────────────────────────
+
     llm = ChatOpenAI(
         model=body.model,
         api_key=openrouter_key,
@@ -73,15 +121,18 @@ async def iverse_agent(body: ChatRequest):
     async def chat_stream_processor():
         total_tokens = 0
         yield f'data: {json.dumps({"thread_id": thread_id, "delta_content": ""})}\n\n'
-        
+
         try:
+<<<<<<< HEAD
             async for chunk in llm.astream(formatted_messages):                     
+=======
+            async for chunk in llm.astream(formatted_messages):
+>>>>>>> 74ec27d (Add api_key check)
                 payload = {"thread_id": thread_id}
-                
+
                 if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
                     usage = chunk.usage_metadata
                     total_tokens = usage.get('total_tokens', 0)
-
                     payload["token_usage"] = usage
 
                 if hasattr(chunk, 'response_metadata') and chunk.response_metadata:
@@ -89,17 +140,31 @@ async def iverse_agent(body: ChatRequest):
 
                     if cost > 0:
                         payload["cost"] = cost
-                        if body.user_id:
+
+                        # CHANGED: resolved_user_id is used here instead of body.user_id
+                        # For token auth: resolved_user_id comes from the verified token
+                        # For legacy auth: resolved_user_id comes from body.user_id
+                        # For anonymous: resolved_user_id is None, no deduction happens
+                        if resolved_user_id:
                             charge_id = str(uuid.uuid4())
                             payload["charge_id"] = charge_id
-                            await queue_credit_deduction(body.user_id, cost, charge_id, thread_id, body.model)
+                            await queue_credit_deduction(
+                                resolved_user_id,
+                                cost,
+                                charge_id,
+                                thread_id,
+                                body.model
+                            )
 
                 if chunk.content:
                     payload["delta_content"] = chunk.content
 
+<<<<<<< HEAD
                 if hasattr(chunk, "additional_kwargs") and "images" in chunk.additional_kwargs:
                     payload["images"] = chunk.additional_kwargs["images"]
                 
+=======
+>>>>>>> 74ec27d (Add api_key check)
                 if hasattr(chunk, "additional_kwargs"):
                     reasoning = chunk.additional_kwargs.get("reasoning_content")
                     if reasoning:
@@ -107,7 +172,7 @@ async def iverse_agent(body: ChatRequest):
 
                 if len(payload) > 1:
                     yield f'data: {json.dumps(payload)}\n\n'
-            
+
             yield f'data: {json.dumps({"thread_id": thread_id, "complete": True, "final_token_usage": {"total_tokens": total_tokens}})}\n\n'
 
         except Exception as e:
