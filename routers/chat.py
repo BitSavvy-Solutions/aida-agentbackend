@@ -155,6 +155,9 @@ async def iverse_agent(req: Request, body: ChatRequest):
                 if chunk.content:
                     payload["delta_content"] = chunk.content
 
+                if hasattr(chunk, "additional_kwargs") and "images" in chunk.additional_kwargs:
+                    payload["images"] = chunk.additional_kwargs["images"]
+                
                 if hasattr(chunk, "additional_kwargs"):
                     reasoning = chunk.additional_kwargs.get("reasoning_content")
                     if reasoning:
