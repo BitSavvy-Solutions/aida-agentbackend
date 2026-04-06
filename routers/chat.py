@@ -38,55 +38,58 @@ async def iverse_agent(req: Request, body: ChatRequest):
     resolved_user_id: Optional[str] = None
     auth_method: str = "anonymous"
 
-    # ── 1. Token Auth Resolution ──
-    auth_header = req.headers.get("Authorization", "")
+    # Determine if the requested model is free early on
+    is_free_model = any(p.match(body.model) for p in COMPILED_ANONYMOUS_PATTERNS)
+
+    # 1. Token Auth Resolution
+    auth_header = req.headers.get("Authorization", "").strip()
+    token_string = ""
+    
     if auth_header.startswith("Bearer "):
-        token_string = auth_header.replace("Bearer ", "").strip()
+        token_string = auth_header[7:].strip()
+
+    if token_string:
         token_doc = await validate_api_token(token_string)
 
         if token_doc:
             resolved_user_id = token_doc.get("userId")
             auth_method = "token"
             
-            # Extract scopes (new format) and status (old format)
+            # Extract scopes and check if blocked
             scopes = token_doc.get("scopes", [])
-
-            # Check if blocked
             if "aida:blocked" in scopes:
                 raise HTTPException(
                     status_code=403,
                     detail="Your account has been suspended. Please contact support."
                 )
-            # If they are not blocked, they automatically have full access to all models.
-
         else:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid or expired token. Please sign in again."
-            )
+            # Only raise an error for invalid tokens if the model requires sign in
+            if not is_free_model:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid or expired token. Please sign in again."
+                )
 
-    # ── 2. Legacy Fallback ──
+    # 2. Legacy Fallback
     # Only runs if no Bearer token was provided
     elif body.user_id:
         resolved_user_id = body.user_id
         auth_method = "legacy"
 
-    # ── 3. Access Control ──
-    is_free_model = any(p.match(body.model) for p in COMPILED_ANONYMOUS_PATTERNS)
-
-    # Logged in users (token or legacy) bypass this check entirely.
-    # Only anonymous users are restricted to free models.
+    # 3. Access Control
+    # Logged in users bypass this check entirely.
+    # Anonymous users are restricted to free models.
     if auth_method == "anonymous" and not is_free_model:
         raise HTTPException(
             status_code=403,
-            detail=f"Model '{body.model}' requires sign-in."
+            detail=f"Model '{body.model}' requires sign in."
         )
 
-    # ── Input Validation ──
+    # Input Validation
     if not body.user_input and not body.image_data_urls and not body.message_history:
         raise HTTPException(status_code=400, detail="Input required.")
 
-    # ── Format Messages ──
+    # Format Messages
     formatted_messages = []
     for msg in body.message_history:
         if msg.get('type') == 'ai':
@@ -103,7 +106,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
     if new_content:
         formatted_messages.append(HumanMessage(content=new_content))
 
-    # ── Stream Logic ──────────────────────────────────────────────────────────
+    # Stream Logic
 
     llm = ChatOpenAI(
         model=body.model,
@@ -123,7 +126,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
         yield f'data: {json.dumps({"thread_id": thread_id, "delta_content": ""})}\n\n'
 
         try:
-            async for chunk in llm.astream(formatted_messages):                     
+            async for chunk in llm.astream(formatted_messages):
                 payload = {"thread_id": thread_id}
 
                 if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
@@ -137,10 +140,6 @@ async def iverse_agent(req: Request, body: ChatRequest):
                     if cost > 0:
                         payload["cost"] = cost
 
-                        # CHANGED: resolved_user_id is used here instead of body.user_id
-                        # For token auth: resolved_user_id comes from the verified token
-                        # For legacy auth: resolved_user_id comes from body.user_id
-                        # For anonymous: resolved_user_id is None, no deduction happens
                         if resolved_user_id:
                             charge_id = str(uuid.uuid4())
                             payload["charge_id"] = charge_id
