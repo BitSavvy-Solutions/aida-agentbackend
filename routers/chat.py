@@ -27,7 +27,7 @@ class ChatRequest(BaseModel):
 
 
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
-ALLOWED_ANONYMOUS_MODELS = [r"google/gemini-3-flash-preview", r"^.*deepseek.*"]
+ALLOWED_ANONYMOUS_MODELS = [r"google/gemini-3.1-flash-lite-preview", r"^.*deepseek.*"]
 COMPILED_ANONYMOUS_PATTERNS = [re.compile(p, re.IGNORECASE) for p in ALLOWED_ANONYMOUS_MODELS]
 
 
