@@ -15,3 +15,4 @@ html2text
 httpx
 beautifulsoup4
 pydantic
+motor
