@@ -1,1 +1,29 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual Environment ---
+venv/
+env/
+.venv/
+
+# --- Environment Variables (Security Risk!) ---
 .env
+.env.local
+
+# --- macOS System Files ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- IDE Settings ---
+.vscode/
+.idea/
+
+# --- Docker ---
+docker-compose.override.yml
+
+# --- Scraped Content Cache (Local) ---
+# If you download blobs locally for testing
+scraped_external_content/
