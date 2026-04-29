@@ -53,24 +53,21 @@ def _handle_sarvam(audio_io: io.BytesIO, model: str, mode: str, language_code: O
     sarvam_params = {
         "file": audio_io,
         "model": model,
-        "mode": mode,
+        "mode": mode, # Pass the mode directly
     }
     if language_code:
         sarvam_params["language_code"] = language_code
     
-    if mode == "translate":
-        response = client.speech_to_text.translate(**sarvam_params)
-    else:
-        response = client.speech_to_text.transcribe(**sarvam_params)
+    # ✅ FIX: Use .transcribe() for ALL v3 modes, including "translate"
+    response = client.speech_to_text.transcribe(**sarvam_params)
     
     raw_data = response if isinstance(response, dict) else response.__dict__
     
-    # Map Sarvam response to Unified Schema
     return UnifiedTranscriptionResponse(
         text=raw_data.get("transcript", ""),
         language=raw_data.get("language_code"),
-        words=raw_data.get("timestamps"), # Maps to None based on Sarvam's current payload
-        duration=None, # Sarvam doesn't provide duration in the root payload
+        words=raw_data.get("timestamps"), 
+        duration=None, 
         provider="sarvam"
     )
 
