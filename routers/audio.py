@@ -1,35 +1,37 @@
-import os
-import json
-import io
+# routers/audio.py
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from openai import OpenAI
+from typing import Optional
+from apis.transcription import process_audio_transcription, UnifiedTranscriptionResponse
 
 router = APIRouter()
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-@router.post("/transcribe_audio")
+@router.post("/transcribe_audio", response_model=UnifiedTranscriptionResponse)
 async def transcribe_audio(
     audio_file: UploadFile = File(...),
     model: str = Form("whisper-1"),
     response_format: str = Form("verbose_json"),
-    timestamp_granularities: str = Form("word")
+    timestamp_granularities: str = Form("word"),
+    language_code: Optional[str] = Form(None),
+    mode: str = Form("transcribe"),
 ):
     try:
-        # Read file content
         audio_content = await audio_file.read()
         
-        # Create a file-like object with the filename
-        audio_io = io.BytesIO(audio_content)
-        audio_io.name = audio_file.filename
-
-        transcription = openai_client.audio.transcriptions.create(
-            file=audio_io,
+        # The transcription service handles the routing and schema normalization
+        result = process_audio_transcription(
+            audio_content=audio_content,
+            filename=audio_file.filename,
             model=model,
+            mode=mode,
+            language_code=language_code,
             response_format=response_format,
-            timestamp_granularities=timestamp_granularities.split(',')
+            timestamp_granularities=timestamp_granularities
         )
 
-        return transcription.model_dump()
+        return result
 
+    except ValueError as ve:
+        # Catch specific validation/configuration errors from our service
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
