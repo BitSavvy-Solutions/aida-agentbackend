@@ -9,7 +9,6 @@ from sarvamai import SarvamAI
 # Initialize OpenAI
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
 # --- 1. Define the Standardized Response Schema ---
 class WordTimestamp(BaseModel):
     word: str
@@ -24,21 +23,31 @@ class UnifiedTranscriptionResponse(BaseModel):
     provider: str
 
 # --- 2. Provider-Specific Handlers ---
-def _handle_openai(audio_io: io.BytesIO, model: str, response_format: str, timestamp_granularities: str) -> UnifiedTranscriptionResponse:
-    transcription = openai_client.audio.transcriptions.create(
-        file=audio_io,
-        model=model,
-        response_format=response_format,
-        timestamp_granularities=timestamp_granularities.split(',') if timestamp_granularities else []
-    )
+def _handle_openai(audio_io: io.BytesIO, model: str, mode: str, response_format: str, timestamp_granularities: str) -> UnifiedTranscriptionResponse:
+    if mode == "translate":
+        # Use OpenAI's Translation endpoint
+        response = openai_client.audio.translations.create(
+            file=audio_io,
+            model=model,
+            response_format=response_format
+            # Note: OpenAI's translation endpoint does NOT support timestamp_granularities
+        )
+    else:
+        # Use OpenAI's Transcription endpoint
+        response = openai_client.audio.transcriptions.create(
+            file=audio_io,
+            model=model,
+            response_format=response_format,
+            timestamp_granularities=timestamp_granularities.split(',') if timestamp_granularities else []
+        )
     
-    raw_data = transcription.model_dump()
+    raw_data = response.model_dump()
     
     # Map OpenAI response to Unified Schema
     return UnifiedTranscriptionResponse(
         text=raw_data.get("text", ""),
-        language=raw_data.get("language"),
-        words=raw_data.get("words"), # OpenAI already returns a compatible list of dicts
+        language=raw_data.get("language", "english" if mode == "translate" else None),
+        words=raw_data.get("words"), 
         duration=raw_data.get("duration"),
         provider="openai"
     )
@@ -53,12 +62,11 @@ def _handle_sarvam(audio_io: io.BytesIO, model: str, mode: str, language_code: O
     sarvam_params = {
         "file": audio_io,
         "model": model,
-        "mode": mode, # Pass the mode directly
+        "mode": mode,
     }
     if language_code:
         sarvam_params["language_code"] = language_code
     
-    # ✅ FIX: Use .transcribe() for ALL v3 modes, including "translate"
     response = client.speech_to_text.transcribe(**sarvam_params)
     
     raw_data = response if isinstance(response, dict) else response.__dict__
@@ -89,4 +97,5 @@ def process_audio_transcription(
     if model.startswith("saaras:") or model.startswith("saarika:"):
         return _handle_sarvam(audio_io, model, mode, language_code)
     else:
-        return _handle_openai(audio_io, model, response_format, timestamp_granularities)
+        # ✅ FIX: Pass the 'mode' parameter to the OpenAI handler
+        return _handle_openai(audio_io, model, mode, response_format, timestamp_granularities)
