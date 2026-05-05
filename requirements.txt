@@ -15,4 +15,7 @@ html2text
 httpx
 beautifulsoup4
 pydantic
+pymongo
 motor
+motor
+sarvamai

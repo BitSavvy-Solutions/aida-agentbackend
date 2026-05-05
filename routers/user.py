@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 router = APIRouter()
 
 # --- Database Connection ---
-CONNECTION_STRING = os.getenv("COSMOS_CONNECTION_STRING")
+CONNECTION_STRING = os.getenv("MONGODB_CONNECTION_STRING")
 DB_NAME = "userdb"
 
 # We initialize the client lazily
