@@ -86,12 +86,6 @@ async def iverse_agent(req: Request, body: ChatRequest):
     # Input Validation
     if not body.user_input and not body.image_data_urls and not body.message_history:
         raise HTTPException(status_code=400, detail="Input required")
-    
-    # ADDED: Fire the background ping (It will instantly exit if 24h haven't passed)
-    if body.user_id:
-        asyncio.create_task(ping_global_user_api(body.user_id))
-    elif body.email:
-        asyncio.create_task(ping_global_user_api(body.email))
 
     # Format Messages
     formatted_messages = []
