@@ -178,6 +178,37 @@ def _transform(raw: dict, available: bool = True, reason: Optional[str] = None) 
     )
 
 
+# ------------------------------------------------------------------
+# Price cap: only return models that cost less than $16
+# ------------------------------------------------------------------
+
+MAX_MODEL_PRICE = 16.0
+
+
+def _is_price_allowed(info: ModelInfo) -> bool:
+    """
+    Return False if any known price component is >= $16.
+    Models with no pricing data are allowed through.
+    """
+    if info.pricing is None:
+        return True
+
+    known_prices = [
+        p for p in (
+            info.pricing.prompt,
+            info.pricing.completion,
+            info.pricing.image,
+            info.pricing.request,
+        )
+        if p is not None
+    ]
+
+    if not known_prices:
+        return True
+
+    return max(known_prices) < MAX_MODEL_PRICE
+
+
 FALLBACK_MODELS: Dict[str, ModelInfo] = {
     "openai/gpt-4o-mini": ModelInfo(
         id="openai/gpt-4o-mini",
@@ -400,7 +431,8 @@ async def _build_default_models(entitlement: dict) -> List[ModelInfo]:
         if info:
             info.available = available
             info.reason = reason
-            results.append(info)
+            if _is_price_allowed(info):
+                results.append(info)
 
     return _sort_default_models(results)
 
@@ -425,7 +457,7 @@ async def get_models(request: Request, q: Optional[str] = None, limit: int = 50)
             mid = raw.get("id")
             available, reason = _availability(mid, entitlement)
             info = _transform(raw, available=available, reason=reason)
-            if info:
+            if info and _is_price_allowed(info):
                 text_models.append(info)
     else:
         text_models = await _build_default_models(entitlement)
