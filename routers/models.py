@@ -3,7 +3,6 @@ import os
 import asyncio
 import logging
 from typing import List, Optional, Dict, Tuple
-from datetime import datetime
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 import httpx
@@ -16,55 +15,61 @@ CACHE_TTL_SECONDS = int(os.getenv("MODELS_CACHE_TTL_SECONDS", "300"))
 SEARCH_LIMIT = int(os.getenv("MODELS_SEARCH_LIMIT", "50"))
 
 # ------------------------------------------------------------------
-# Curated defaults and tier rules (now used for availability, not filtering)
+# Curated defaults
 # ------------------------------------------------------------------
 
-DEFAULT_TEXT_MODEL = "openai/gpt-4o-mini"
+DEFAULT_TEXT_MODEL = "deepseek/deepseek-v4-pro"
 
 DEFAULT_TEXT_MODEL_IDS = [
-    "openai/gpt-4o-mini",
-    "openai/gpt-4o",
-    "anthropic/claude-3.5-sonnet",
-    "google/gemini-2.5-flash-preview",
-    "deepseek/deepseek-chat",
-    "meta-llama/llama-3.3-70b-instruct",
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v3.2",
+    "deepseek/deepseek-chat-v3-0324",
+    "openai/gpt-5.1",
+    "google/gemini-3.1-pro-preview",
+    "google/gemini-3.1-flash-lite-preview",
+    "~anthropic/claude-sonnet-latest",
+    "~anthropic/claude-haiku-latest",
+    "google/gemini-2.5-flash-image",
     "perplexity/sonar",
+    "z-ai/glm-5.2",
+    "qwen/qwen3.7-max",
+    "minimax/minimax-m3",
+    "moonshotai/kimi-k2.7-code",
+    "xiaomi/mimo-v2.5-pro",
 ]
 
 FREE_MODELS = {
-    "openai/gpt-4o-mini",
-    "deepseek/deepseek-chat",
-    "google/gemini-2.5-flash-preview",
-}
-
-PLUS_MODELS = {
-    *FREE_MODELS,
-    "openai/gpt-4o",
-    "anthropic/claude-3.5-sonnet",
-    "meta-llama/llama-3.3-70b-instruct",
-    "perplexity/sonar",
-}
-
-PRO_MODELS = {
-    *PLUS_MODELS,
-    "anthropic/claude-3.5-opus",
-    "openai/gpt-4.5-preview",
-}
-
-CREDIT_GATED_MODELS = {
-    "anthropic/claude-3.5-opus": 0.50,
-    "openai/gpt-4.5-preview": 0.50,
+    "google/gemini-3.1-flash-lite-preview",
+    "deepseek/deepseek-chat-v3-0324",
 }
 
 RECOMMENDED_FREE = [
-    "google/gemini-2.5-flash-preview",
-    "openai/gpt-4o-mini",
+    "google/gemini-3.1-flash-lite-preview",
+    "deepseek/deepseek-chat-v3-0324",
 ]
 
 RECOMMENDED_PAID = [
-    "openai/gpt-4o",
-    "anthropic/claude-3.5-sonnet",
+    "openai/gpt-5.1",
+    "~anthropic/claude-sonnet-latest",
 ]
+
+CATEGORY_OVERRIDES = {
+    "deepseek/deepseek-v4-pro": "reasoning",
+    "deepseek/deepseek-v3.2": "reasoning",
+    "deepseek/deepseek-chat-v3-0324": "reasoning",
+    "openai/gpt-5.1": "reasoning",
+    "google/gemini-3.1-pro-preview": "reasoning",
+    "google/gemini-3.1-flash-lite-preview": "chat",
+    "~anthropic/claude-sonnet-latest": "reasoning",
+    "~anthropic/claude-haiku-latest": "reasoning",
+    "google/gemini-2.5-flash-image": "vision",
+    "perplexity/sonar": "chat",
+    "z-ai/glm-5.2": "reasoning",
+    "qwen/qwen3.7-max": "reasoning",
+    "minimax/minimax-m3": "reasoning",
+    "moonshotai/kimi-k2.7-code": "reasoning",
+    "xiaomi/mimo-v2.5-pro": "reasoning",
+}
 
 
 # ------------------------------------------------------------------
@@ -163,7 +168,8 @@ def _transform(raw: dict, available: bool = True, reason: Optional[str] = None) 
     return ModelInfo(
         id=model_id,
         name=raw.get("name") or model_id.split("/")[-1].replace("-", " ").title(),
-        category=_categorize(model_id, arch.get("modality"), arch.get("instruct_type")),
+        category=CATEGORY_OVERRIDES.get(model_id)
+                 or _categorize(model_id, arch.get("modality"), arch.get("instruct_type")),
         modality=arch.get("modality"),
         context_length=raw.get("context_length"),
         pricing=ModelPricing(
@@ -209,68 +215,20 @@ def _is_price_allowed(info: ModelInfo) -> bool:
     return max(known_prices) < MAX_MODEL_PRICE
 
 
-FALLBACK_MODELS: Dict[str, ModelInfo] = {
-    "openai/gpt-4o-mini": ModelInfo(
-        id="openai/gpt-4o-mini",
-        name="GPT-4o mini",
-        category="chat",
-        modality="text+image->text",
-        context_length=128000,
-        pricing=ModelPricing(prompt=0.15, completion=0.60),
-    ),
-    "openai/gpt-4o": ModelInfo(
-        id="openai/gpt-4o",
-        name="GPT-4o",
-        category="vision",
-        modality="text+image->text",
-        context_length=128000,
-        pricing=ModelPricing(prompt=2.5, completion=10.0),
-    ),
-    "anthropic/claude-3.5-sonnet": ModelInfo(
-        id="anthropic/claude-3.5-sonnet",
-        name="Claude 3.5 Sonnet",
-        category="chat",
-        modality="text+image->text",
-        context_length=200000,
-        pricing=ModelPricing(prompt=3.0, completion=15.0),
-    ),
-    "google/gemini-2.5-flash-preview": ModelInfo(
-        id="google/gemini-2.5-flash-preview",
-        name="Gemini 2.5 Flash Preview",
-        category="chat",
-        modality="text+image->text",
-        context_length=1000000,
-        pricing=ModelPricing(prompt=0.15, completion=0.60),
-    ),
-    "deepseek/deepseek-chat": ModelInfo(
-        id="deepseek/deepseek-chat",
-        name="DeepSeek Chat",
-        category="chat",
-        modality="text->text",
-        context_length=64000,
-        pricing=ModelPricing(prompt=0.14, completion=0.28),
-    ),
-    "meta-llama/llama-3.3-70b-instruct": ModelInfo(
-        id="meta-llama/llama-3.3-70b-instruct",
-        name="Llama 3.3 70B Instruct",
-        category="chat",
-        modality="text->text",
-        context_length=128000,
-        pricing=ModelPricing(prompt=0.12, completion=0.30),
-    ),
-    "perplexity/sonar": ModelInfo(
-        id="perplexity/sonar",
-        name="Perplexity Sonar",
-        category="chat",
-        modality="text->text",
-        context_length=128000,
-        pricing=ModelPricing(prompt=0.20, completion=0.20),
-    ),
-}
+def _fallback_model(model_id: str) -> Optional[ModelInfo]:
+    """
+    Generate a minimal fallback ModelInfo when OpenRouter detail fetch fails.
+    """
+    return ModelInfo(
+        id=model_id,
+        name=model_id.split("/")[-1].replace("-", " ").title(),
+        category=CATEGORY_OVERRIDES.get(model_id, "chat"),
+        pricing=ModelPricing(),
+    )
 
 
 # ------------------------------------------------------------------
-# Availability logic (visible, not filtered)
+# Availability logic
 # ------------------------------------------------------------------
 
 async def _resolve_user_entitlement(token_string: Optional[str]) -> dict:
@@ -279,56 +237,21 @@ async def _resolve_user_entitlement(token_string: Optional[str]) -> dict:
     no token is supplied or if lookup fails.
     """
     result = {
-        "tier": "free",
-        "balance": 0.0,
         "is_anonymous": True,
     }
 
     if not token_string:
         return result
 
-    # If you have a validate_api_token helper, use it here.
-    # token_doc = await validate_api_token(token_string)
-    # if not token_doc:
-    #     return result
+    # If you wire in auth later, set is_anonymous=False here.
     # result["is_anonymous"] = False
-    # scopes = set(token_doc.get("scopes") or [])
-    # if "aida:pro" in scopes:
-    #     result["tier"] = "pro"
-    # elif "aida:plus" in scopes:
-    #     result["tier"] = "plus"
-    # user_id = token_doc.get("userId")
-    # if user_id:
-    #     client = get_mongo_client()
-    #     db = client[os.getenv("MONGODB_DB_NAME", "userdb")]
-    #     user_doc = await db.users.find_one({"userId": user_id})
-    #     if user_doc:
-    #         sub = user_doc.get("subscriptionTier") or user_doc.get("subscription") or "free"
-    #         if sub in ("pro", "enterprise"):
-    #             result["tier"] = "pro"
-    #         elif sub == "plus" and result["tier"] not in ("pro",):
-    #             result["tier"] = "plus"
-    #     credit_doc = await db.user_credits.find_one({"userId": user_id})
-    #     if credit_doc:
-    #         result["balance"] = float(credit_doc.get("balance", 0.0))
 
     return result
 
 
 def _availability(model_id: str, entitlement: dict) -> Tuple[bool, Optional[str]]:
-    tier = entitlement.get("tier", "free")
-    balance = entitlement.get("balance", 0.0)
-
-    if model_id in PRO_MODELS and tier not in ("pro", "enterprise"):
-        return False, "Requires Pro subscription"
-
-    if model_id in PLUS_MODELS and tier not in ("plus", "pro", "enterprise"):
-        return False, "Requires Plus or Pro subscription"
-
-    min_balance = CREDIT_GATED_MODELS.get(model_id)
-    if min_balance and balance < min_balance:
-        return False, f"Requires at least ${min_balance:.2f} in credits"
-
+    if entitlement.get("is_anonymous", True) and model_id not in FREE_MODELS:
+        return False, "Requires sign in"
     return True, None
 
 
@@ -426,7 +349,7 @@ async def _build_default_models(entitlement: dict) -> List[ModelInfo]:
     for mid in DEFAULT_TEXT_MODEL_IDS:
         available, reason = _availability(mid, entitlement)
         raw = _detail_cache.get(mid)
-        info = _transform(raw, available=available, reason=reason) if raw else FALLBACK_MODELS.get(mid)
+        info = _transform(raw, available=available, reason=reason) if raw else _fallback_model(mid)
 
         if info:
             info.available = available
@@ -468,7 +391,7 @@ async def get_models(request: Request, q: Optional[str] = None, limit: int = 50)
     if default_text not in available_ids:
         default_text = next((m.id for m in text_models if m.available), DEFAULT_TEXT_MODEL)
 
-    recommended = list(RECOMMENDED_PAID if entitlement["tier"] in ("plus", "pro", "enterprise") else RECOMMENDED_FREE)
+    recommended = list(RECOMMENDED_PAID if not entitlement.get("is_anonymous", True) else RECOMMENDED_FREE)
     recommended = [m for m in recommended if m in {x.id for x in text_models} or not q]
 
     return ModelsResponse(
