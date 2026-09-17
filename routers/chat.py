@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import re
+import base64
 import logging
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Request
@@ -14,14 +15,28 @@ from dependencies.auth import validate_api_token
 
 router = APIRouter()
 
+MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+
 # Pydantic Model for Request Body
 class ChatRequest(BaseModel):
     user_input: Optional[str] = None
     image_data_urls: List[str] = []
+    pdf_attachments: List[str] = []  # base64 data URLs, e.g. "data:application/pdf;base64,..."
     model: str = 'google/gemini-flash-1.5'
     user_id: Optional[str] = None
     message_history: List[Dict[str, Any]] = []
     thread_id: Optional[str] = None
+
+
+def validate_pdf_data_url(data_url: str) -> None:
+    if not data_url.startswith("data:application/pdf;base64,"):
+        raise HTTPException(status_code=400, detail="Invalid PDF attachment format")
+    try:
+        decoded = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid PDF attachment encoding")
+    if len(decoded) > MAX_PDF_SIZE_BYTES:
+        raise HTTPException(status_code=413, detail="PDF attachment exceeds 20 MB limit")
 
 
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
@@ -84,8 +99,11 @@ async def iverse_agent(req: Request, body: ChatRequest):
         )
 
     # Input Validation
-    if not body.user_input and not body.image_data_urls and not body.message_history:
+    if not body.user_input and not body.image_data_urls and not body.pdf_attachments and not body.message_history:
         raise HTTPException(status_code=400, detail="Input required")
+
+    for pdf in body.pdf_attachments:
+        validate_pdf_data_url(pdf)
 
     # Format Messages
     formatted_messages = []
@@ -100,6 +118,14 @@ async def iverse_agent(req: Request, body: ChatRequest):
         new_content.append({"type": "text", "text": body.user_input})
     for url in body.image_data_urls:
         new_content.append({"type": "image_url", "image_url": {"url": url}})
+    for idx, pdf_data_url in enumerate(body.pdf_attachments):
+        new_content.append({
+            "type": "file",
+            "file": {
+                "file_data": pdf_data_url,
+                "filename": f"attachment_{idx + 1}.pdf"
+            }
+        })
 
     if new_content:
         formatted_messages.append(HumanMessage(content=new_content))
