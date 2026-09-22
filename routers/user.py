@@ -1,10 +1,10 @@
 import os
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, Query
 from fastapi.security import OAuth2PasswordBearer
 from motor.motor_asyncio import AsyncIOMotorClient
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 router = APIRouter()
 
@@ -71,10 +71,15 @@ class UserProfileResponse(BaseModel):
 class TransactionLog(BaseModel):
     transactionId: str
     amount: float
-    date: datetime
+    date: str
     type: str # "CREDIT" or "USAGE"
     description: str
     details: Optional[Dict[str, Any]] = None
+
+class PaginatedResponse(BaseModel):
+    data: List[TransactionLog]
+    has_more: bool
+    total_cost: float = 0.0
 
 # --- Endpoints ---
 
@@ -98,64 +103,129 @@ async def get_user_profile(user: str = Depends(get_current_user)):
     }
 
 
-@router.get("/credits/history", response_model=List[TransactionLog])
-async def get_credit_history(user: str = Depends(get_current_user)):
+@router.get("/credits/history", response_model=PaginatedResponse)
+async def get_credit_history(
+    cursor: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=100),
+    user: str = Depends(get_current_user)
+):
     """
     Fetches ONLY payment history (Stripe Top-ups) using token.
     """
     user_id = user.get("userId")
 
-    # Query Transactions
-    # Filter: userId matches AND type is 'CREDIT'
-    cursor = db.credit_transactions.find({
+    # Base query for credits
+    query = {
         "userId": user_id,
-        "type": "CREDIT" 
-    }).sort("transactionDate", -1).limit(50)
+        "type": "CREDIT"
+    }
+
+    # Apply cursor if loading more
+    if cursor:
+        query["transactionDate"] = {"$lt": cursor}
+
+    # Fetch limit + 1 to check if there are more records
+    db_cursor = db.credit_transactions.find(query).sort("transactionDate", -1).limit(limit + 1)
 
     history = []
-    async for doc in cursor:
+    async for doc in db_cursor:
         public_id = doc.get("chargeId") or doc.get("transactionId") or str(doc.get("_id"))
         desc = doc.get("details", {}).get("description") or doc.get("reason") or "Top-up"
+
+        tx_date = doc.get("transactionDate")
+        if isinstance(tx_date, datetime):
+            tx_date = tx_date.isoformat()
 
         history.append({
             "transactionId": public_id,
             "amount": doc.get("creditChange"),
-            "date": doc.get("transactionDate"),
+            "date": tx_date,
             "type": "CREDIT",
             "description": desc,
             "details": doc.get("details")
         })
-    
-    return history
+
+    has_more = len(history) > limit
+    if has_more:
+        history.pop()
+
+    return {"data": history, "has_more": has_more, "total_cost": 0.0}
 
 
-@router.get("/usage/logs", response_model=List[TransactionLog])
-async def get_usage_logs(user: str = Depends(get_current_user)):
+@router.get("/usage/logs", response_model=PaginatedResponse)
+async def get_usage_logs(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    cursor: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=100),
+    user: str = Depends(get_current_user)
+):
     """
     Fetches ONLY AI usage logs using token.
     """
     user_id = user.get("userId")
+    # 1. Base Query for Usage
+    query = {"userId": user_id, "creditChange": {"$lt": 0}}
+    date_filter = {}
 
-    # Query Transactions
-    # Filter: userId matches AND creditChange is negative (spending)
-    cursor = db.credit_transactions.find({
-        "userId": user_id,
-        "creditChange": {"$lt": 0} 
-    }).sort("transactionDate", -1).limit(100)
+    # Handle Date Range (String comparison works if dates are stored as ISO strings)
+    if start_date:
+        # Start of day
+        date_filter["$gte"] = f"{start_date}T00:00:00"
+    if end_date:
+        # End of day
+        date_filter["$lte"] = f"{end_date}T23:59:59.999999"
+
+    # 2. Apply Cursor (Overrides upper bound)
+    if cursor:
+        date_filter["$lt"] = cursor
+
+    if date_filter:
+        query["transactionDate"] = date_filter
+
+    # 3. Calculate Total Cost (Only for the selected date range, ignoring cursor)
+    cost_query = {"userId": user_id, "creditChange": {"$lt": 0}}
+    cost_date_filter = {}
+    if start_date: cost_date_filter["$gte"] = f"{start_date}T00:00:00"
+    if end_date: cost_date_filter["$lte"] = f"{end_date}T23:59:59.999999"
+    if cost_date_filter: cost_query["transactionDate"] = cost_date_filter
+
+    pipeline = [
+        {"$match": cost_query},
+        {"$group": {
+                "_id": None, 
+                "total_cost": {"$sum": "$creditChange"}
+            }
+        }
+    ]
+    agg_result = await db.credit_transactions.aggregate(pipeline).to_list(1)
+    # Convert negative usage to positive cost
+    total_cost = abs(agg_result[0]["total_cost"]) if agg_result else 0.0
+
+    # 4. Fetch Paginated Data
+    db_cursor = db.credit_transactions.find(query).sort("transactionDate", -1).limit(limit + 1)
 
     logs = []
-    async for doc in cursor:
+    async for doc in db_cursor:
         details = doc.get("details", {})
         public_id = doc.get("chargeId") or doc.get("transactionId") or str(doc.get("_id"))
         model_name = details.get("modelUsed") or doc.get("reason") or "Unknown Model"
 
+        tx_date = doc.get("transactionDate")
+        if isinstance(tx_date, datetime):
+            tx_date = tx_date.isoformat()
+
         logs.append({
             "transactionId": public_id,
             "amount": doc.get("creditChange"),
-            "date": doc.get("transactionDate"),
+            "date": tx_date,
             "type": "USAGE",
             "description": model_name, 
             "details": details
         })
     
-    return logs
+    has_more = len(logs) > limit
+    if has_more:
+        logs.pop()
+    
+    return {"data": logs, "has_more": has_more, "total_cost": total_cost}
