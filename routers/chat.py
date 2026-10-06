@@ -39,6 +39,27 @@ def validate_pdf_data_url(data_url: str) -> None:
         raise HTTPException(status_code=413, detail="PDF attachment exceeds 20 MB limit")
 
 
+def build_human_content(text: Optional[str], image_urls: List[str], pdf_urls: List[str], pdf_offset: int = 0):
+    # Plain string when there are no attachments, so text-only history stays unchanged
+    if not image_urls and not pdf_urls:
+        return text or ""
+
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    for url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    for idx, pdf_data_url in enumerate(pdf_urls):
+        content.append({
+            "type": "file",
+            "file": {
+                "file_data": pdf_data_url,
+                "filename": f"attachment_{pdf_offset + idx + 1}.pdf"
+            }
+        })
+    return content
+
+
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
 ALLOWED_ANONYMOUS_MODELS = [r"google/gemini-3.1-flash-lite-preview", r"^.*deepseek.*"]
 COMPILED_ANONYMOUS_PATTERNS = [re.compile(p, re.IGNORECASE) for p in ALLOWED_ANONYMOUS_MODELS]
@@ -107,28 +128,25 @@ async def iverse_agent(req: Request, body: ChatRequest):
 
     # Format Messages
     formatted_messages = []
+    pdf_count = 0
     for msg in body.message_history:
         if msg.get('type') == 'ai':
             formatted_messages.append(AIMessage(content=msg.get('content')))
         elif msg.get('type') == 'human':
-            formatted_messages.append(HumanMessage(content=msg.get('content')))
+            history_images = msg.get('image_data_urls') or []
+            history_pdfs = msg.get('pdf_attachments') or []
+            for pdf in history_pdfs:
+                validate_pdf_data_url(pdf)
+            formatted_messages.append(HumanMessage(
+                content=build_human_content(msg.get('content'), history_images, history_pdfs, pdf_count)
+            ))
+            pdf_count += len(history_pdfs)
 
-    new_content = []
-    if body.user_input:
-        new_content.append({"type": "text", "text": body.user_input})
-    for url in body.image_data_urls:
-        new_content.append({"type": "image_url", "image_url": {"url": url}})
-    for idx, pdf_data_url in enumerate(body.pdf_attachments):
-        new_content.append({
-            "type": "file",
-            "file": {
-                "file_data": pdf_data_url,
-                "filename": f"attachment_{idx + 1}.pdf"
-            }
-        })
-
-    if new_content:
-        formatted_messages.append(HumanMessage(content=new_content))
+    # Top-level fields are kept for clients that still send the current turn separately
+    if body.user_input or body.image_data_urls or body.pdf_attachments:
+        formatted_messages.append(HumanMessage(
+            content=build_human_content(body.user_input, body.image_data_urls, body.pdf_attachments, pdf_count)
+        ))
 
     # Stream Logic
 
