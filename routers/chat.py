@@ -12,6 +12,7 @@ from apis.chunk_enhancer import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 from apis.credit_manager import queue_credit_deduction
 from dependencies.auth import validate_api_token
+from routers.models import model_accepts_images
 
 router = APIRouter()
 
@@ -126,14 +127,26 @@ async def iverse_agent(req: Request, body: ChatRequest):
     for pdf in body.pdf_attachments:
         validate_pdf_data_url(pdf)
 
+    # The current turn is the top-level fields when a client sends them, otherwise the last human history item
+    has_top_level_turn = bool(body.user_input or body.image_data_urls or body.pdf_attachments)
+    last_human_idx = max((i for i, m in enumerate(body.message_history) if m.get('type') == 'human'), default=-1)
+    # Text-only models reject image parts, so earlier-turn images are only resent to models that take them
+    accepts_images = await model_accepts_images(body.model)
+
     # Format Messages
     formatted_messages = []
     pdf_count = 0
-    for msg in body.message_history:
+    for idx, msg in enumerate(body.message_history):
         if msg.get('type') == 'ai':
             formatted_messages.append(AIMessage(content=msg.get('content')))
         elif msg.get('type') == 'human':
             history_images = msg.get('image_data_urls') or []
+            is_current_turn = idx == last_human_idx and not has_top_level_turn
+            if not accepts_images and not is_current_turn:
+                history_images = []
+            elif idx == last_human_idx and body.image_data_urls:
+                # Older widgets send the current turn's images both here and at the top level
+                history_images = [u for u in history_images if u not in body.image_data_urls]
             history_pdfs = msg.get('pdf_attachments') or []
             for pdf in history_pdfs:
                 validate_pdf_data_url(pdf)
@@ -143,7 +156,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
             pdf_count += len(history_pdfs)
 
     # Top-level fields are kept for clients that still send the current turn separately
-    if body.user_input or body.image_data_urls or body.pdf_attachments:
+    if has_top_level_turn:
         formatted_messages.append(HumanMessage(
             content=build_human_content(body.user_input, body.image_data_urls, body.pdf_attachments, pdf_count)
         ))
