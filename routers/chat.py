@@ -2,7 +2,6 @@ import os
 import json
 import uuid
 import re
-import base64
 import logging
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Request
@@ -15,7 +14,6 @@ from dependencies.auth import validate_api_token
 
 router = APIRouter()
 
-MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
 
 # Pydantic Model for Request Body
 class ChatRequest(BaseModel):
@@ -28,15 +26,25 @@ class ChatRequest(BaseModel):
     thread_id: Optional[str] = None
 
 
-def validate_pdf_data_url(data_url: str) -> None:
-    if not data_url.startswith("data:application/pdf;base64,"):
-        raise HTTPException(status_code=400, detail="Invalid PDF attachment format")
-    try:
-        decoded = base64.b64decode(data_url.split(",", 1)[1], validate=True)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid PDF attachment encoding")
-    if len(decoded) > MAX_PDF_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail="PDF attachment exceeds 20 MB limit")
+def build_human_content(text: Optional[str], image_urls: List[str], pdf_urls: List[str], pdf_offset: int = 0):
+    # Plain string when there are no attachments, so text-only history stays unchanged
+    if not image_urls and not pdf_urls:
+        return text or ""
+
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    for url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    for idx, pdf_data_url in enumerate(pdf_urls):
+        content.append({
+            "type": "file",
+            "file": {
+                "file_data": pdf_data_url,
+                "filename": f"attachment_{pdf_offset + idx + 1}.pdf"
+            }
+        })
+    return content
 
 
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
@@ -102,33 +110,29 @@ async def iverse_agent(req: Request, body: ChatRequest):
     if not body.user_input and not body.image_data_urls and not body.pdf_attachments and not body.message_history:
         raise HTTPException(status_code=400, detail="Input required")
 
-    for pdf in body.pdf_attachments:
-        validate_pdf_data_url(pdf)
+    # The current turn is the top-level fields when a client sends them, otherwise the last human history item
+    has_top_level_turn = bool(body.user_input or body.image_data_urls or body.pdf_attachments)
+    last_human_idx = max((i for i, m in enumerate(body.message_history) if m.get('type') == 'human'), default=-1)
 
     # Format Messages
     formatted_messages = []
-    for msg in body.message_history:
+    pdf_count = 0
+    for idx, msg in enumerate(body.message_history):
         if msg.get('type') == 'ai':
             formatted_messages.append(AIMessage(content=msg.get('content')))
         elif msg.get('type') == 'human':
-            formatted_messages.append(HumanMessage(content=msg.get('content')))
+            history_images = msg.get('image_data_urls') or []
+            history_pdfs = msg.get('pdf_attachments') or []
+            formatted_messages.append(HumanMessage(
+                content=build_human_content(msg.get('content'), history_images, history_pdfs, pdf_count)
+            ))
+            pdf_count += len(history_pdfs)
 
-    new_content = []
-    if body.user_input:
-        new_content.append({"type": "text", "text": body.user_input})
-    for url in body.image_data_urls:
-        new_content.append({"type": "image_url", "image_url": {"url": url}})
-    for idx, pdf_data_url in enumerate(body.pdf_attachments):
-        new_content.append({
-            "type": "file",
-            "file": {
-                "file_data": pdf_data_url,
-                "filename": f"attachment_{idx + 1}.pdf"
-            }
-        })
-
-    if new_content:
-        formatted_messages.append(HumanMessage(content=new_content))
+    # Top-level fields are kept for clients that still send the current turn separately
+    if has_top_level_turn:
+        formatted_messages.append(HumanMessage(
+            content=build_human_content(body.user_input, body.image_data_urls, body.pdf_attachments, pdf_count)
+        ))
 
     # Stream Logic
 
