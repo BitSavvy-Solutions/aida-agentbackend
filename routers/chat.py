@@ -2,7 +2,6 @@ import os
 import json
 import uuid
 import re
-import base64
 import logging
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Request
@@ -12,11 +11,9 @@ from apis.chunk_enhancer import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 from apis.credit_manager import queue_credit_deduction
 from dependencies.auth import validate_api_token
-from routers.models import model_accepts_images
 
 router = APIRouter()
 
-MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
 
 # Pydantic Model for Request Body
 class ChatRequest(BaseModel):
@@ -27,17 +24,6 @@ class ChatRequest(BaseModel):
     user_id: Optional[str] = None
     message_history: List[Dict[str, Any]] = []
     thread_id: Optional[str] = None
-
-
-def validate_pdf_data_url(data_url: str) -> None:
-    if not data_url.startswith("data:application/pdf;base64,"):
-        raise HTTPException(status_code=400, detail="Invalid PDF attachment format")
-    try:
-        decoded = base64.b64decode(data_url.split(",", 1)[1], validate=True)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid PDF attachment encoding")
-    if len(decoded) > MAX_PDF_SIZE_BYTES:
-        raise HTTPException(status_code=413, detail="PDF attachment exceeds 20 MB limit")
 
 
 def build_human_content(text: Optional[str], image_urls: List[str], pdf_urls: List[str], pdf_offset: int = 0):
@@ -124,14 +110,9 @@ async def iverse_agent(req: Request, body: ChatRequest):
     if not body.user_input and not body.image_data_urls and not body.pdf_attachments and not body.message_history:
         raise HTTPException(status_code=400, detail="Input required")
 
-    for pdf in body.pdf_attachments:
-        validate_pdf_data_url(pdf)
-
     # The current turn is the top-level fields when a client sends them, otherwise the last human history item
     has_top_level_turn = bool(body.user_input or body.image_data_urls or body.pdf_attachments)
     last_human_idx = max((i for i, m in enumerate(body.message_history) if m.get('type') == 'human'), default=-1)
-    # Text-only models reject image parts, so earlier-turn images are only resent to models that take them
-    accepts_images = await model_accepts_images(body.model)
 
     # Format Messages
     formatted_messages = []
@@ -141,15 +122,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
             formatted_messages.append(AIMessage(content=msg.get('content')))
         elif msg.get('type') == 'human':
             history_images = msg.get('image_data_urls') or []
-            is_current_turn = idx == last_human_idx and not has_top_level_turn
-            if not accepts_images and not is_current_turn:
-                history_images = []
-            elif idx == last_human_idx and body.image_data_urls:
-                # Older widgets send the current turn's images both here and at the top level
-                history_images = [u for u in history_images if u not in body.image_data_urls]
             history_pdfs = msg.get('pdf_attachments') or []
-            for pdf in history_pdfs:
-                validate_pdf_data_url(pdf)
             formatted_messages.append(HumanMessage(
                 content=build_human_content(msg.get('content'), history_images, history_pdfs, pdf_count)
             ))

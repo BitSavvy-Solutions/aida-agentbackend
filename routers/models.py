@@ -280,26 +280,6 @@ async def _fetch_model_detail(slug: str) -> Optional[dict]:
     return None
 
 
-async def model_accepts_images(model_id: str) -> bool:
-    """
-    True if the model takes image input. Unknown models return True so
-    behaviour only changes for models we know are text-only.
-    """
-    raw = _detail_cache.get(model_id) or await _fetch_model_detail(model_id)
-    if not raw:
-        return True
-
-    arch = raw.get("architecture") or {}
-    input_modalities = arch.get("input_modalities")
-    if isinstance(input_modalities, list):
-        return "image" in input_modalities
-
-    modality = arch.get("modality")
-    if not modality:
-        return True
-    return "image" in modality.split("->")[0]
-
-
 async def _ensure_default_details(ids: List[str]):
     missing = [i for i in ids if i not in _detail_cache]
     if missing:
