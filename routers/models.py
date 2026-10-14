@@ -83,6 +83,13 @@ class ModelPricing(BaseModel):
     request: Optional[float] = None
 
 
+class ModelReasoning(BaseModel):
+    supported_efforts: Optional[List[str]] = None
+    default_effort: Optional[str] = None
+    default_enabled: Optional[bool] = None
+    mandatory: bool = False
+
+
 class ModelInfo(BaseModel):
     id: str
     name: str
@@ -93,6 +100,7 @@ class ModelInfo(BaseModel):
     description: Optional[str] = None
     available: bool = True
     reason: Optional[str] = None
+    reasoning: Optional[ModelReasoning] = None
 
 
 AUDIO_MODELS = [
@@ -157,6 +165,19 @@ def _categorize(model_id: str, modality: Optional[str], instruct_type: Optional[
     return "chat"
 
 
+def _reasoning_info(raw: dict) -> Optional[ModelReasoning]:
+    """None when the model does not support reasoning."""
+    if "reasoning" not in (raw.get("supported_parameters") or []):
+        return None
+    details = raw.get("reasoning") or {}
+    return ModelReasoning(
+        supported_efforts=details.get("supported_efforts"),
+        default_effort=details.get("default_effort"),
+        default_enabled=details.get("default_enabled"),
+        mandatory=bool(details.get("mandatory")),
+    )
+
+
 def _transform(raw: dict, available: bool = True, reason: Optional[str] = None) -> Optional[ModelInfo]:
     model_id = raw.get("id")
     if not model_id:
@@ -181,6 +202,7 @@ def _transform(raw: dict, available: bool = True, reason: Optional[str] = None) 
         description=raw.get("description"),
         available=available,
         reason=reason,
+        reasoning=_reasoning_info(raw),
     )
 
 

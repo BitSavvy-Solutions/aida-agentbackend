@@ -24,6 +24,18 @@ class ChatRequest(BaseModel):
     user_id: Optional[str] = None
     message_history: List[Dict[str, Any]] = []
     thread_id: Optional[str] = None
+    reasoning: Optional[Dict[str, Any]] = None  # forwarded to OpenRouter, e.g. {"effort": "high", "enabled": True}
+
+
+ALLOWED_REASONING_KEYS = {"effort", "enabled", "exclude", "max_tokens"}
+
+
+def build_reasoning_config(reasoning_from_frontend: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if reasoning_from_frontend:
+        config = {k: v for k, v in reasoning_from_frontend.items() if k in ALLOWED_REASONING_KEYS}
+        if config:
+            return config
+    return {"enabled": True}
 
 
 def build_human_content(text: Optional[str], image_urls: List[str], pdf_urls: List[str], pdf_offset: int = 0):
@@ -143,9 +155,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
         temperature=0.2,
         stream_usage=True,
         extra_body={
-            "reasoning": {
-                "enabled": True
-            }
+            "reasoning": build_reasoning_config(body.reasoning)
         }
     )
 
