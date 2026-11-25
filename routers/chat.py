@@ -11,6 +11,7 @@ from apis.chunk_enhancer import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 from apis.credit_manager import queue_credit_deduction
 from dependencies.auth import validate_api_token
+from routers.models import is_model_free
 
 router = APIRouter()
 
@@ -60,8 +61,6 @@ def build_human_content(text: Optional[str], image_urls: List[str], pdf_urls: Li
 
 
 openrouter_key = os.getenv("OPENROUTER_API_KEY")
-ALLOWED_ANONYMOUS_MODELS = [r"google/gemini-3.1-flash-lite-preview", r"^.*deepseek.*"]
-COMPILED_ANONYMOUS_PATTERNS = [re.compile(p, re.IGNORECASE) for p in ALLOWED_ANONYMOUS_MODELS]
 
 
 @router.post("/iverse_agent")
@@ -72,7 +71,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
     auth_method: str = "anonymous"
 
     # Determine if the requested model is free early on
-    is_free_model = any(p.match(body.model) for p in COMPILED_ANONYMOUS_PATTERNS)
+    model_is_free = await is_model_free(body.model)
 
     # 1. Token Auth Resolution
     auth_header = req.headers.get("Authorization", "").strip()
@@ -97,7 +96,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
                 )
         else:
             # Only raise an error for invalid tokens if the model requires sign in
-            if not is_free_model:
+            if not model_is_free:
                 raise HTTPException(
                     status_code=401,
                     detail="Invalid or expired token. Please sign in again."
@@ -112,7 +111,7 @@ async def iverse_agent(req: Request, body: ChatRequest):
     # 3. Access Control
     # Logged in users bypass this check entirely.
     # Anonymous users are restricted to free models.
-    if auth_method == "anonymous" and not is_free_model:
+    if auth_method == "anonymous" and not model_is_free:
         raise HTTPException(
             status_code=403,
             detail=f"Model '{body.model}' requires sign in."

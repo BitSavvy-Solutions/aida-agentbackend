@@ -38,11 +38,6 @@ DEFAULT_TEXT_MODEL_IDS = [
     "xiaomi/mimo-v2.5-pro",
 ]
 
-FREE_MODELS = {
-    "google/gemini-3.1-flash-lite-preview",
-    "deepseek/deepseek-chat-v3-0324",
-}
-
 RECOMMENDED_FREE = [
     "google/gemini-3.1-flash-lite-preview",
     "deepseek/deepseek-chat-v3-0324",
@@ -129,6 +124,17 @@ class ModelsResponse(BaseModel):
 _detail_cache: Dict[str, dict] = {}
 _background_task: Optional[asyncio.Task] = None
 
+# Derived catalog cache, invalidated whenever _detail_cache changes
+_catalog_cache: Dict[str, List[ModelInfo]] = {}
+_detail_cache_version = 0
+
+
+def _bump_detail_version() -> None:
+    """Invalidate the derived catalog cache whenever the raw cache changes."""
+    global _detail_cache_version
+    _detail_cache_version += 1
+    _catalog_cache.clear()
+
 
 # ------------------------------------------------------------------
 # Helpers
@@ -178,7 +184,7 @@ def _reasoning_info(raw: dict) -> Optional[ModelReasoning]:
     )
 
 
-def _transform(raw: dict, available: bool = True, reason: Optional[str] = None) -> Optional[ModelInfo]:
+def _transform(raw: dict, available: bool = True, reason: Optional[str] = None, include_description: bool = True) -> Optional[ModelInfo]:
     model_id = raw.get("id")
     if not model_id:
         return None
@@ -199,7 +205,7 @@ def _transform(raw: dict, available: bool = True, reason: Optional[str] = None) 
             image=_safe_float(pricing_raw.get("image")),
             request=_safe_float(pricing_raw.get("request")),
         ),
-        description=raw.get("description"),
+        description=raw.get("description") if include_description else None,
         available=available,
         reason=reason,
         reasoning=_reasoning_info(raw),
@@ -250,6 +256,52 @@ def _fallback_model(model_id: str) -> Optional[ModelInfo]:
 
 
 # ------------------------------------------------------------------
+# Free model detection (single source of truth)
+# ------------------------------------------------------------------
+
+def _raw_pricing_is_free(raw: dict) -> bool:
+    """Free means every usage-based price component is zero or negative."""
+    pricing = raw.get("pricing") or {}
+    prompt = _safe_float(pricing.get("prompt"))
+    completion = _safe_float(pricing.get("completion"))
+    request = _safe_float(pricing.get("request"))
+    if prompt is None or completion is None:
+        return False  # can't verify, fail closed
+    if prompt > 0 or completion > 0:
+        return False
+    if request is not None and request > 0:
+        return False
+    return True
+
+
+def _is_free_pricing(pricing: Optional[ModelPricing]) -> bool:
+    """A model is free when every usage-based price component is zero."""
+    if pricing is None:
+        return False
+    return (
+        pricing.prompt == 0
+        and pricing.completion == 0
+        and not pricing.request
+    )
+
+
+async def is_model_free(model_id: str) -> bool:
+    """
+    Authoritative free-model check based on live OpenRouter pricing.
+    Serves from the warm cache; on a miss, fetches the model detail once.
+    Fails closed: an unknown model is treated as paid.
+    """
+    # Strip OpenRouter variant suffixes like ":online" from "provider/model:variant"
+    base_id = model_id.split(":")[0] if "/" in model_id else model_id
+    raw = _detail_cache.get(base_id)
+    if raw is None:
+        raw = await _fetch_model_detail(base_id)  # fetches and caches on miss
+    if raw is None:
+        return False
+    return _raw_pricing_is_free(raw)
+
+
+# ------------------------------------------------------------------
 # Availability logic
 # ------------------------------------------------------------------
 
@@ -272,8 +324,10 @@ async def _resolve_user_entitlement(token_string: Optional[str]) -> dict:
 
 
 def _availability(model_id: str, entitlement: dict) -> Tuple[bool, Optional[str]]:
-    if entitlement.get("is_anonymous", True) and model_id not in FREE_MODELS:
-        return False, "Requires sign in"
+    if entitlement.get("is_anonymous", True):
+        raw = _detail_cache.get(model_id)
+        if raw is None or not _raw_pricing_is_free(raw):
+            return False, "Requires sign in"
     return True, None
 
 
@@ -295,6 +349,7 @@ async def _fetch_model_detail(slug: str) -> Optional[dict]:
             raw = payload.get("data") if isinstance(payload.get("data"), dict) else payload
             if isinstance(raw, dict) and raw.get("id"):
                 _detail_cache[raw["id"]] = raw
+                _bump_detail_version()
                 return raw
     except Exception as exc:
         logger.warning("Could not fetch model detail for %s: %s", slug, exc)
@@ -322,6 +377,7 @@ async def _fetch_openrouter_search(q: str, limit: int) -> List[dict]:
         for r in items:
             if r.get("id"):
                 _detail_cache[r["id"]] = r
+        _bump_detail_version()
         return items[:limit]
 
 
@@ -338,6 +394,7 @@ async def refresh_full_cache():
         for r in raw_list:
             if r.get("id"):
                 _detail_cache[r["id"]] = r
+        _bump_detail_version()
         logger.info("OpenRouter background cache warmed with %s models", len(raw_list))
     except Exception as exc:
         logger.error("Background cache refresh failed: %s", exc)
@@ -382,12 +439,39 @@ async def _build_default_models(entitlement: dict) -> List[ModelInfo]:
     return _sort_default_models(results)
 
 
+def _build_full_catalog(entitlement: dict, free_only: bool) -> List[ModelInfo]:
+    """Build the full catalog from the warmed cache. Cached per cache-version,
+    anonymity and free-filter, so repeat requests are pure serialization."""
+    key = f"{_detail_cache_version}|anon={entitlement.get('is_anonymous', True)}|free={free_only}"
+    cached = _catalog_cache.get(key)
+    if cached is not None:
+        return cached
+
+    results: List[ModelInfo] = []
+    for raw in _detail_cache.values():
+        model_id = raw.get("id")
+        if not model_id:
+            continue
+        available, reason = _availability(model_id, entitlement)
+        info = _transform(raw, available=available, reason=reason, include_description=False)
+        if not info or not _is_price_allowed(info):
+            continue
+        if free_only and not _is_free_pricing(info.pricing):
+            continue
+        results.append(info)
+
+    # Signed-in-capable models first, then free models, then alphabetical
+    results.sort(key=lambda m: (not m.available, not _is_free_pricing(m.pricing), m.name.lower()))
+    _catalog_cache[key] = results
+    return results
+
+
 # ------------------------------------------------------------------
 # Endpoint
 # ------------------------------------------------------------------
 
 @router.get("/models", response_model=ModelsResponse)
-async def get_models(request: Request, q: Optional[str] = None, limit: int = 50):
+async def get_models(request: Request, q: Optional[str] = None, limit: int = 50, free: bool = False, full: bool = False):
     auth_header = request.headers.get("Authorization", "")
     token_string = ""
     if auth_header.startswith("Bearer "):
@@ -395,7 +479,13 @@ async def get_models(request: Request, q: Optional[str] = None, limit: int = 50)
 
     entitlement = await _resolve_user_entitlement(token_string or None)
 
-    if q and q.strip():
+    if full:
+        # Cold-start safety: warm the cache synchronously if the background
+        # refresh has not populated it yet.
+        if not _detail_cache:
+            await refresh_full_cache()
+        text_models = _build_full_catalog(entitlement, free_only=free)
+    elif q and q.strip():
         raw_results = await _fetch_openrouter_search(q.strip(), min(limit, SEARCH_LIMIT))
         text_models = []
         for raw in raw_results:
@@ -407,7 +497,10 @@ async def get_models(request: Request, q: Optional[str] = None, limit: int = 50)
     else:
         text_models = await _build_default_models(entitlement)
 
-    # Default selection: pick the first available model, falling back to the global default
+    # Apply the free filter to search/default responses too
+    if free and not full:
+        text_models = [m for m in text_models if _is_free_pricing(m.pricing)]
+
     default_text = DEFAULT_TEXT_MODEL
     available_ids = {m.id for m in text_models if m.available}
     if default_text not in available_ids:
