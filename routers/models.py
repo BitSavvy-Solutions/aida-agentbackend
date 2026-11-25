@@ -286,28 +286,19 @@ def _is_free_pricing(pricing: Optional[ModelPricing]) -> bool:
 
 
 async def is_model_free(model_id: str) -> bool:
-    """
-    Authoritative free-model check based on live OpenRouter pricing.
-    Serves from the warm cache; on a miss, fetches the model detail once.
-    Fails closed: an unknown model is treated as paid.
-    """
-    # Try the exact ID first (e.g. "baidu/ernie-5.5-flash-preview:free")
-    raw = _detail_cache.get(model_id)
-    if raw is None:
-        raw = await _fetch_model_detail(model_id)
+    # Strip trailing variant suffixes like ":online" (web search)
+    base_id = model_id
+    while base_id.endswith(":online"):
+        base_id = base_id[: -len(":online")]
 
-    # Fall back to stripping known variant suffixes like ":online"
-    if raw is None and "/" in model_id and ":" in model_id:
-        base_id = model_id.split(":")[0]
-        raw = _detail_cache.get(base_id)
-        if raw is None:
-            raw = await _fetch_model_detail(base_id)
+    raw = _detail_cache.get(base_id)
+    if raw is None:
+        raw = await _fetch_model_detail(base_id)
 
     if raw is not None:
         return _raw_pricing_is_free(raw)
 
-    # Last resort: OpenRouter marks free models with a ":free" suffix
-    return model_id.endswith(":free")
+    return base_id.endswith(":free")
 
 
 # ------------------------------------------------------------------
