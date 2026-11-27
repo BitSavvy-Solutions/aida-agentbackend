@@ -1,8 +1,10 @@
 # routers/models.py
 import os
+import re
+import time
 import asyncio
 import logging
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 import httpx
@@ -11,8 +13,10 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+OPENROUTER_MODEL_URL = "https://openrouter.ai/api/v1/model"
 CACHE_TTL_SECONDS = int(os.getenv("MODELS_CACHE_TTL_SECONDS", "300"))
 SEARCH_LIMIT = int(os.getenv("MODELS_SEARCH_LIMIT", "50"))
+ENDPOINTS_CACHE_TTL_SECONDS = int(os.getenv("MODEL_ENDPOINTS_CACHE_TTL_SECONDS", "300"))
 
 # ------------------------------------------------------------------
 # Curated defaults
@@ -96,6 +100,7 @@ class ModelInfo(BaseModel):
     available: bool = True
     reason: Optional[str] = None
     reasoning: Optional[ModelReasoning] = None
+    intelligence_index: Optional[float] = None
 
 
 AUDIO_MODELS = [
@@ -118,6 +123,72 @@ class ModelsResponse(BaseModel):
 
 
 # ------------------------------------------------------------------
+# Detail schemas
+# ------------------------------------------------------------------
+
+PRICING_DETAIL_KEYS = [
+    "prompt",
+    "completion",
+    "input_cache_read",
+    "input_cache_write",
+    "request",
+    "image",
+    "web_search",
+    "internal_reasoning",
+]
+
+
+class ModelPricingDetail(BaseModel):
+    prompt: Optional[float] = None
+    completion: Optional[float] = None
+    input_cache_read: Optional[float] = None
+    input_cache_write: Optional[float] = None
+    request: Optional[float] = None
+    image: Optional[float] = None
+    web_search: Optional[float] = None
+    internal_reasoning: Optional[float] = None
+
+
+class ProviderEndpoint(BaseModel):
+    provider_name: str
+    tag: Optional[str] = None
+    context_length: Optional[int] = None
+    quantization: Optional[str] = None
+    status: Optional[int] = None
+    uptime_last_30m: Optional[float] = None
+    pricing: Optional[ModelPricingDetail] = None
+    supported_parameters: List[str] = []
+
+
+class ModelDetailResponse(BaseModel):
+    id: str
+    canonical_slug: Optional[str] = None
+    name: str
+    description: Optional[str] = None
+    created: Optional[int] = None
+    hugging_face_id: Optional[str] = None
+    knowledge_cutoff: Optional[str] = None
+    context_length: Optional[int] = None
+    architecture: Optional[Dict[str, Any]] = None
+    pricing: Optional[ModelPricingDetail] = None
+    top_provider: Optional[Dict[str, Any]] = None
+    supported_parameters: List[str] = []
+    api_endpoints: List[str] = []
+    benchmarks: Optional[Dict[str, Any]] = None
+    category: str = "chat"
+    is_free: bool = False
+    available: bool = True
+    reason: Optional[str] = None
+    reasoning: Optional[ModelReasoning] = None
+    providers: List[ProviderEndpoint] = []
+
+
+class RelatedModelsResponse(BaseModel):
+    same_author: List[ModelInfo] = []
+    similar: List[ModelInfo] = []
+
+
+# ------------------------------------------------------------------
 # Caches
 # ------------------------------------------------------------------
 
@@ -127,6 +198,9 @@ _background_task: Optional[asyncio.Task] = None
 # Derived catalog cache, invalidated whenever _detail_cache changes
 _catalog_cache: Dict[str, List[ModelInfo]] = {}
 _detail_cache_version = 0
+
+# Per-model provider endpoints cache: model_id -> (monotonic_ts, endpoints)
+_endpoints_cache: Dict[str, Tuple[float, List[dict]]] = {}
 
 
 def _bump_detail_version() -> None:
@@ -154,6 +228,19 @@ def _safe_float(value) -> Optional[float]:
         return float(value)
     except (ValueError, TypeError):
         return None
+
+
+# Display names with bracketed variant markers (e.g. "(batch)") are not
+# accessible from the UX and must be filtered out of all model lists.
+BLOCKED_NAME_PATTERNS = [
+    re.compile(r"\(\s*batch\s*\)", re.IGNORECASE),
+]
+
+
+def _is_name_allowed(name: Optional[str]) -> bool:
+    if not name:
+        return True
+    return not any(p.search(name) for p in BLOCKED_NAME_PATTERNS)
 
 
 def _categorize(model_id: str, modality: Optional[str], instruct_type: Optional[str]) -> str:
@@ -184,6 +271,11 @@ def _reasoning_info(raw: dict) -> Optional[ModelReasoning]:
     )
 
 
+def _intelligence_index(raw: dict) -> Optional[float]:
+    aa = (raw.get("benchmarks") or {}).get("artificial_analysis") or {}
+    return _safe_float(aa.get("intelligence_index"))
+
+
 def _transform(raw: dict, available: bool = True, reason: Optional[str] = None, include_description: bool = True) -> Optional[ModelInfo]:
     model_id = raw.get("id")
     if not model_id:
@@ -209,38 +301,31 @@ def _transform(raw: dict, available: bool = True, reason: Optional[str] = None, 
         available=available,
         reason=reason,
         reasoning=_reasoning_info(raw),
+        intelligence_index=_intelligence_index(raw),
+    )
+
+
+def _pricing_detail(pricing_raw: dict) -> ModelPricingDetail:
+    return ModelPricingDetail(
+        **{k: _safe_float(pricing_raw.get(k)) for k in PRICING_DETAIL_KEYS}
     )
 
 
 # ------------------------------------------------------------------
-# Price cap: only return models that cost less than $16
+# Price cap: applies to the OUTPUT (completion) price only
 # ------------------------------------------------------------------
 
-MAX_MODEL_PRICE = 16.0
+MAX_MODEL_PRICE = float(os.getenv("MAX_MODEL_OUTPUT_PRICE", "16"))
 
 
 def _is_price_allowed(info: ModelInfo) -> bool:
     """
-    Return False if any known price component is >= $16.
-    Models with no pricing data are allowed through.
+    The cap applies to the OUTPUT (completion) price only.
+    Models with no completion price data are allowed through.
     """
-    if info.pricing is None:
+    if info.pricing is None or info.pricing.completion is None:
         return True
-
-    known_prices = [
-        p for p in (
-            info.pricing.prompt,
-            info.pricing.completion,
-            info.pricing.image,
-            info.pricing.request,
-        )
-        if p is not None
-    ]
-
-    if not known_prices:
-        return True
-
-    return max(known_prices) < MAX_MODEL_PRICE
+    return info.pricing.completion < MAX_MODEL_PRICE
 
 
 def _fallback_model(model_id: str) -> Optional[ModelInfo]:
@@ -341,7 +426,7 @@ async def _fetch_model_detail(slug: str) -> Optional[dict]:
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.get(f"{OPENROUTER_MODELS_URL}/{slug}", headers=_headers())
+            resp = await client.get(f"{OPENROUTER_MODEL_URL}/{slug}", headers=_headers())
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
@@ -349,12 +434,35 @@ async def _fetch_model_detail(slug: str) -> Optional[dict]:
             raw = payload.get("data") if isinstance(payload.get("data"), dict) else payload
             if isinstance(raw, dict) and raw.get("id"):
                 _detail_cache[raw["id"]] = raw
+                if slug != raw["id"]:
+                    _detail_cache[slug] = raw  # aliases resolve to a concrete id
                 _bump_detail_version()
                 return raw
     except Exception as exc:
         logger.warning("Could not fetch model detail for %s: %s", slug, exc)
 
     return None
+
+
+async def _fetch_model_endpoints(model_id: str) -> List[dict]:
+    now = time.monotonic()
+    cached = _endpoints_cache.get(model_id)
+    if cached and now - cached[0] < ENDPOINTS_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{OPENROUTER_MODELS_URL}/{model_id}/endpoints", headers=_headers()
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            endpoints = data.get("endpoints") or []
+            _endpoints_cache[model_id] = (time.monotonic(), endpoints)
+            return endpoints
+    except Exception as exc:
+        logger.warning("Could not fetch endpoints for %s: %s", model_id, exc)
+        return []
 
 
 async def _ensure_default_details(ids: List[str]):
@@ -407,6 +515,44 @@ async def periodic_refresh_cache():
 
 
 # ------------------------------------------------------------------
+# Query-time enforcement
+# ------------------------------------------------------------------
+
+async def enforce_model_price_cap(model_id: str) -> None:
+    """
+    Raises 403 if the requested model is a blocked variant or its
+    output price exceeds the account cap. Called before any LLM call.
+    """
+    base_id = model_id
+    while base_id.endswith(":online"):
+        base_id = base_id[: -len(":online")]
+
+    raw = _detail_cache.get(base_id)
+    if raw is None:
+        raw = await _fetch_model_detail(base_id)
+    if raw is None:
+        # Unknown model: let OpenRouter surface its own error
+        return
+
+    if not _is_name_allowed(raw.get("name")):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Model '{model_id}' is a restricted variant and is not available.",
+        )
+
+    completion = _safe_float((raw.get("pricing") or {}).get("completion"))
+    if completion is not None and completion >= MAX_MODEL_PRICE:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Model '{model_id}' costs ${completion:.2f} per million output tokens. "
+                f"Models higher than ${MAX_MODEL_PRICE:.2f} output cost are not allowed "
+                f"on your account."
+            ),
+        )
+
+
+# ------------------------------------------------------------------
 # Build responses
 # ------------------------------------------------------------------
 
@@ -426,8 +572,10 @@ async def _build_default_models(entitlement: dict) -> List[ModelInfo]:
 
     results = []
     for mid in DEFAULT_TEXT_MODEL_IDS:
-        available, reason = _availability(mid, entitlement)
         raw = _detail_cache.get(mid)
+        if raw and not _is_name_allowed(raw.get("name")):
+            continue
+        available, reason = _availability(mid, entitlement)
         info = _transform(raw, available=available, reason=reason) if raw else _fallback_model(mid)
 
         if info:
@@ -439,10 +587,10 @@ async def _build_default_models(entitlement: dict) -> List[ModelInfo]:
     return _sort_default_models(results)
 
 
-def _build_full_catalog(entitlement: dict, free_only: bool) -> List[ModelInfo]:
+def _build_full_catalog(entitlement: dict, free_only: bool, cap: bool = True) -> List[ModelInfo]:
     """Build the full catalog from the warmed cache. Cached per cache-version,
-    anonymity and free-filter, so repeat requests are pure serialization."""
-    key = f"{_detail_cache_version}|anon={entitlement.get('is_anonymous', True)}|free={free_only}"
+    anonymity, free-filter, and cap setting, so repeat requests are pure serialization."""
+    key = f"{_detail_cache_version}|anon={entitlement.get('is_anonymous', True)}|free={free_only}|cap={cap}"
     cached = _catalog_cache.get(key)
     if cached is not None:
         return cached
@@ -452,9 +600,13 @@ def _build_full_catalog(entitlement: dict, free_only: bool) -> List[ModelInfo]:
         model_id = raw.get("id")
         if not model_id:
             continue
+        if not _is_name_allowed(raw.get("name")):
+            continue
         available, reason = _availability(model_id, entitlement)
         info = _transform(raw, available=available, reason=reason, include_description=False)
-        if not info or not _is_price_allowed(info):
+        if not info:
+            continue
+        if cap and not _is_price_allowed(info):
             continue
         if free_only and not _is_free_pricing(info.pricing):
             continue
@@ -467,11 +619,11 @@ def _build_full_catalog(entitlement: dict, free_only: bool) -> List[ModelInfo]:
 
 
 # ------------------------------------------------------------------
-# Endpoint
+# Endpoints
 # ------------------------------------------------------------------
 
 @router.get("/models", response_model=ModelsResponse)
-async def get_models(request: Request, q: Optional[str] = None, limit: int = 50, free: bool = False, full: bool = False):
+async def get_models(request: Request, q: Optional[str] = None, limit: int = 50, free: bool = False, full: bool = False, cap: bool = True):
     auth_header = request.headers.get("Authorization", "")
     token_string = ""
     if auth_header.startswith("Bearer "):
@@ -484,12 +636,14 @@ async def get_models(request: Request, q: Optional[str] = None, limit: int = 50,
         # refresh has not populated it yet.
         if not _detail_cache:
             await refresh_full_cache()
-        text_models = _build_full_catalog(entitlement, free_only=free)
+        text_models = _build_full_catalog(entitlement, free_only=free, cap=cap)
     elif q and q.strip():
         raw_results = await _fetch_openrouter_search(q.strip(), min(limit, SEARCH_LIMIT))
         text_models = []
         for raw in raw_results:
             mid = raw.get("id")
+            if not _is_name_allowed(raw.get("name")):
+                continue
             available, reason = _availability(mid, entitlement)
             info = _transform(raw, available=available, reason=reason)
             if info and _is_price_allowed(info):
@@ -514,4 +668,125 @@ async def get_models(request: Request, q: Optional[str] = None, limit: int = 50,
         audio=AUDIO_MODELS,
         defaults=Defaults(text=default_text, audio="whisper-1"),
         recommended=recommended,
+    )
+
+
+# NOTE: this route must be registered BEFORE the catch-all /model/{model_id:path}
+# route below, otherwise "related" would be swallowed into the model id.
+@router.get("/model/{model_id:path}/related", response_model=RelatedModelsResponse)
+async def get_model_related(model_id: str):
+    if not _detail_cache:
+        await refresh_full_cache()
+
+    raw = _detail_cache.get(model_id)
+    if raw is None:
+        raw = await _fetch_model_detail(model_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    target_id = raw.get("id", model_id)
+    author = target_id.split("/")[0]
+    arch = raw.get("architecture") or {}
+    target_category = CATEGORY_OVERRIDES.get(target_id) or _categorize(
+        target_id, arch.get("modality"), arch.get("instruct_type")
+    )
+    target_intel = _intelligence_index(raw)
+
+    same_author: List[ModelInfo] = []
+    similar: List[ModelInfo] = []
+    seen = {target_id}
+
+    for oid, other in _detail_cache.items():
+        mid = other.get("id")
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        if not _is_name_allowed(other.get("name")):
+            continue
+        info = _transform(other, include_description=False)
+        if info is None or not _is_price_allowed(info):
+            continue
+        if mid.split("/")[0] == author:
+            if len(same_author) < 8:
+                same_author.append(info)
+            continue
+        if info.category == target_category:
+            similar.append(info)
+
+    def similarity(info: ModelInfo):
+        oi = info.intelligence_index
+        if target_intel is not None:
+            if oi is not None:
+                return (0, abs(oi - target_intel), info.name.lower())
+            return (1, 0, info.name.lower())
+        if oi is not None:
+            return (0, -oi, info.name.lower())
+        return (2, 0, info.name.lower())
+
+    similar.sort(key=similarity)
+
+    return RelatedModelsResponse(same_author=same_author, similar=similar[:8])
+
+
+@router.get("/model/{model_id:path}", response_model=ModelDetailResponse)
+async def get_model_detail(request: Request, model_id: str):
+    model_id = model_id.strip().strip("/")
+    if not model_id:
+        raise HTTPException(status_code=404, detail="Model id is required")
+
+    raw = _detail_cache.get(model_id)
+    if raw is None:
+        raw = await _fetch_model_detail(model_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    # Availability follows the same rules as the picker
+    auth_header = request.headers.get("Authorization", "")
+    token_string = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+    entitlement = await _resolve_user_entitlement(token_string or None)
+
+    resolved_id = raw.get("id", model_id)
+    available, reason = _availability(resolved_id, entitlement)
+    if not _is_name_allowed(raw.get("name")):
+        available, reason = False, "This model variant is not accessible"
+
+    endpoints_raw = await _fetch_model_endpoints(resolved_id)
+    providers = [
+        ProviderEndpoint(
+            provider_name=e.get("provider_name") or "Unknown",
+            tag=e.get("tag"),
+            context_length=e.get("context_length"),
+            quantization=e.get("quantization"),
+            status=e.get("status"),
+            uptime_last_30m=e.get("uptime_last_30m"),
+            pricing=_pricing_detail(e.get("pricing") or {}),
+            supported_parameters=e.get("supported_parameters") or [],
+        )
+        for e in endpoints_raw
+    ]
+
+    arch = raw.get("architecture") or {}
+
+    return ModelDetailResponse(
+        id=resolved_id,
+        canonical_slug=raw.get("canonical_slug"),
+        name=raw.get("name") or resolved_id.split("/")[-1].replace("-", " ").title(),
+        description=raw.get("description"),
+        created=raw.get("created"),
+        hugging_face_id=raw.get("hugging_face_id"),
+        knowledge_cutoff=raw.get("knowledge_cutoff"),
+        context_length=raw.get("context_length"),
+        architecture=arch,
+        pricing=_pricing_detail(raw.get("pricing") or {}),
+        top_provider=raw.get("top_provider"),
+        supported_parameters=raw.get("supported_parameters") or [],
+        api_endpoints=raw.get("endpoints") or [],
+        benchmarks=raw.get("benchmarks"),
+        category=CATEGORY_OVERRIDES.get(resolved_id)
+        or _categorize(resolved_id, arch.get("modality"), arch.get("instruct_type")),
+        is_free=_raw_pricing_is_free(raw),
+        available=available,
+        reason=reason,
+        reasoning=_reasoning_info(raw),
+        providers=providers,
     )

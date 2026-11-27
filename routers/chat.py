@@ -11,7 +11,7 @@ from apis.chunk_enhancer import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
 from apis.credit_manager import queue_credit_deduction
 from dependencies.auth import validate_api_token
-from routers.models import is_model_free
+from routers.models import is_model_free, enforce_model_price_cap
 
 router = APIRouter()
 
@@ -66,6 +66,9 @@ openrouter_key = os.getenv("OPENROUTER_API_KEY")
 @router.post("/iverse_agent")
 async def iverse_agent(req: Request, body: ChatRequest):
     thread_id = body.thread_id or str(uuid.uuid4())
+
+    # Enforce variant and output-price restrictions before doing anything else
+    await enforce_model_price_cap(body.model)
 
     resolved_user_id: Optional[str] = None
     auth_method: str = "anonymous"
